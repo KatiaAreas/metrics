@@ -1,8 +1,4 @@
-"""
-SCRIPT DE DÉMONSTRATION
-Génère des données synthétiques pour tester immédiatement le toolkit
-sans avoir besoin de vos propres fichiers PLY/STL/depth
-"""
+
 
 import numpy as np
 import trimesh

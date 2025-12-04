@@ -8,11 +8,12 @@ dependencies = [
     "areas-common",
     "matplotlib>=3.10.6",
     "opencv-contrib-python>=4.11.0.86",
+    "opencv-python>=4.11.0.86",
     "pyqt5>=5.15.11",
     "scipy>=1.14.1",
 ]
 
 [tool.uv.sources]
-areas-common = { git = "ssh://git@github.com/areas-ai/areas-python-common.git" }
+areas_common = { git = "ssh://git@github.com/areas-ai/areas-python-common.git" }
 areas_theta_compute = { git = "ssh://git@github.com/areas-theta-compute.git" }
 
