@@ -7,7 +7,7 @@ from typing import Literal
 # Define a type for the camera model to ensure only valid values are used.
 CameraModel = Literal["circle", "ellipse"]
 AngleDetectorType = Literal["ots", "notch"]
-DisplayType = Literal["calib", "pen"]
+DisplayType = Literal["calib", "pen" , "pyramid"]
 
 @dataclass(frozen=True)
 class ExperimentConfig:

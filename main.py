@@ -3,29 +3,29 @@
 from pathlib import Path
 from config import ExperimentConfig
 from paths import ExperimentPaths
-from utils import display_calib
+from utils import display_calib, display_pyramid
 from calib_data import CalibData
 
 from areas_common.data_loading.rigid_body import read_data
 
+
 def main():
     """
-    Main workflow for loading experiment data and playing the associated video.
+    Main workflow for loading experiment data and displaying video with overlays.
     """
     # 1. Configure the experiment
-    # To run a different experiment, you only need to change the values here.
     config = ExperimentConfig(
         base_data_dir=Path("/mnt/areas_nas/data/AREAS data/Knee/SLAM/bdd_SLAM/areas_2025-11-20/knee_pyramid/water"),
         experiment_name="pyramid",
-        camera_model_type="ellipse",
+        camera_model_type="circle",
         data_prefix="pyramid_0",
-        angle_detector_type="ots",
-        display_type="calib"
+        angle_detector_type="notch",
+        display_type="pyramid"  # Options: "calib", "pen", "pyramid"
     )
 
     # 2. Set up and validate all required file paths
     paths = ExperimentPaths(config)
-    paths.validate_paths() # Ensures files exist before we proceed
+    paths.validate_paths()
 
     # 3. Load and process the rigid body tracking data
     print("Loading rigid body data...")
@@ -33,9 +33,9 @@ def main():
         header_path=paths.headers_path,
         data_path=paths.data_path,
         video_timestamps_path=paths.timestamp_path,
-        unit_scale=1.0  # Defines the scaling factor (1.0 = no change)
+        unit_scale=1.0
     )
-    print(f"Rigid bodies Data loaded successfully. Found {len(rb_data)} data points.")
+    print(f"Rigid bodies data loaded successfully. Found {len(rb_data)} data points.")
 
     # 4. Load camera calibration data
     calib_data = CalibData(
@@ -44,15 +44,38 @@ def main():
         camera_model_path=paths.camera_model_path,
         ots_ref_pose_path=paths.reference_ots_angle_pose
     )
-    print(f"Camera Calibration Data loaded successfully.")
+    print(f"Camera calibration data loaded successfully.")
 
+    # 5. Display based on mode
+    if config.display_type == "pyramid":
+        # Display pyramid summits overlay
+        print("Starting pyramid display mode...")
 
-    # 5. Play the corresponding video
-    display_calib(paths.video_path,
-                rb_data, calib_data,
-                use_notch=(config.angle_detector_type == "notch"),
-                pen_mode=(config.display_type == "pen")
-            )
+        # Define path to pyramid JSON file
+        pyramid_json_path = Path(config.base_data_dir) / "ModelMire3DSLAM.json"
+
+        if not pyramid_json_path.exists():
+            print(f"Error: Pyramid JSON file not found at {pyramid_json_path}")
+            print("Please update the pyramid_json_path in main.py")
+            return
+
+        display_pyramid(
+            video_path=paths.video_path,
+            rb_data=rb_data,
+            calib_data=calib_data,
+            pyramid_json_path=pyramid_json_path,
+            use_notch=(config.angle_detector_type == "notch")
+        )
+    else:
+        # Display calibration or pen markers
+        display_calib(
+            video_path=paths.video_path,
+            rb_data=rb_data,
+            calib_data=calib_data,
+            use_notch=(config.angle_detector_type == "notch"),
+            pen_mode=(config.display_type == "pen"),
+            pyramid_mode=(config.display_type == "pyramid")
+        )
 
 
 if __name__ == "__main__":
