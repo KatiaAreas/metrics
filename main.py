@@ -7,6 +7,13 @@ from utils import display_calib, display_pyramid
 from calib_data import CalibData
 
 from areas_common.data_loading.rigid_body import read_data
+from visualize_rb import visualize_rigid_body
+import matplotlib
+matplotlib.use("TkAgg")  # or "Qt5Agg"
+
+import matplotlib.pyplot as plt
+from pyramid_transformer import PyramidTransformer
+from calibrate_pyramid_to_optitrack import complete_workflow_with_visualization
 
 
 def main():
@@ -46,25 +53,46 @@ def main():
     )
     print(f"Camera calibration data loaded successfully.")
 
+
     # 5. Display based on mode
     if config.display_type == "pyramid":
         # Display pyramid summits overlay
         print("Starting pyramid display mode...")
 
         # Define path to pyramid JSON file
-        pyramid_json_path = Path(config.base_data_dir) / "ModelMire3DSLAM.json"
+        pyramid_json_path = Path(config.base_data_dir) / "ModelMire3DSLAM2.json"
 
-        if not pyramid_json_path.exists():
-            print(f"Error: Pyramid JSON file not found at {pyramid_json_path}")
-            print("Please update the pyramid_json_path in main.py")
-            return
+        frame=0
+        fig, ax,distance, rot_constellation_opti, rot_data = visualize_rigid_body(rb_data, frame_id=frame)
+        # plt.show()
+
+
+
+        # ONE FUNCTION DOES EVERYTHING:
+        transformer, rmse = complete_workflow_with_visualization(
+            rb_data,
+            pyramid_json_path,
+            frame_id=frame,
+            R_constellation_to_optitrack=rot_constellation_opti,  # or None for identity
+            save_plot=True  # Creates constellation_frame.png
+        )
+
+        transformer.plot_constellation_frame(save_path="constellation_frame.png")
+
+
+
+        # Transform points:
+        points_optitrack = transformer.transform_pyramid_to_optitrack(points_pyramid_mm)
+
+
 
         display_pyramid(
             video_path=paths.video_path,
             rb_data=rb_data,
             calib_data=calib_data,
             pyramid_json_path=pyramid_json_path,
-            use_notch=(config.angle_detector_type == "notch")
+            use_notch=(config.angle_detector_type == "notch"),
+            R_const_to_opt=rot_constellation_opti
         )
     else:
         # Display calibration or pen markers

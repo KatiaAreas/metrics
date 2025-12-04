@@ -5,10 +5,11 @@ import cv2
 from pathlib import Path
 from scipy.spatial.transform import Rotation
 import numpy as np
+import numpy.typing as npt
 
 from calib_data import CalibData
 from areas_theta_compute import NotchAngleComputer, get_default_weights_path
-from pyramid_manager import PyramidManager
+from pyramid_transformer import PyramidTransformer, extract_marker_positions_from_rb_data
 
 
 def rotation_correction_ccw(theta_degrees, ox, oy):
@@ -68,7 +69,8 @@ def display_pyramid(
         rb_data: dict[str, Any],
         calib_data: CalibData,
         pyramid_json_path: Path,
-        use_notch: bool = True
+        use_notch: bool = True,
+        R_const_to_opt: npt.NDArray[np.float64] | None = None,
 ) -> None:
     """
     Display pyramid summits overlaid on video frames.
@@ -84,10 +86,60 @@ def display_pyramid(
         use_notch: Whether to use notch detection for angle estimation
     """
     # Load pyramid geometry and get summits in OptiTrack frame
-    pyramid_manager = PyramidManager(pyramid_json_path)
-    summits_optitrack_frame = pyramid_manager.get_summits_in_optitrack_frame()
+    points_pyramid = PyramidTransformer(pyramid_json_path)
+    transformer.print_info()
 
-    print(f"Loaded pyramid with {len(summits_optitrack_frame)} summit points")
+    # ========================================================================
+    # STEP 2: Extract OptiTrack data
+    # ========================================================================
+    print("\n[STEP 2] Extracting OptiTrack data...")
+
+    marker_positions_local_mm, rb_position_m, rb_quaternion = \
+        extract_marker_positions_from_rb_data(rb_data, frame_id)
+
+    print(f"\nRigid body pose (world frame):")
+    print(f"  Position: {rb_position_m} m")
+    print(f"  Quaternion [x,y,z,w]: {rb_quaternion}")
+
+    print(f"\nMarker positions (constellation local frame, mm):")
+    for name, pos in marker_positions_local_mm.items():
+        print(f"  {name}: {pos}")
+
+    # ========================================================================
+    # STEP 3: Match constellation markers
+    # ========================================================================
+    print("\n[STEP 3] Matching constellation markers...")
+
+    # Initial guess (you provided this)
+    initial_guess = {
+        'Marker 002': 20,
+        'Marker 003': 19,
+        'Marker 001': 21,
+        'Marker 004': 18
+    }
+
+    # Brute force matching (will verify initial guess or find better match)
+    matching = transformer.match_constellation_markers(
+        marker_positions_local_mm,
+        initial_guess
+    )
+
+
+
+    # Extract marker positions from rb_data:
+    marker_pos, rb_pos, rb_quat = extract_marker_positions_from_rb_data(rb_data)
+    # Match constellation markers:
+    initial_guess = {
+        'Marker 002': 20,
+        'Marker 003': 19,
+        'Marker 001': 21,
+        'Marker 004': 18
+    }
+    matching = transformer.match_constellation_markers(marker_pos, initial_guess)
+    # Set OptiTrack rotation:
+    transformer.set_optitrack_rotation(R_const_to_opt)
+    points_optitrack = transformer.transform_pyramid_to_optitrack(points_pyramid)
+
 
     # Open video
     cap = cv2.VideoCapture(str(video_path))

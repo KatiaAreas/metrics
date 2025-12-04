@@ -1,0 +1,36 @@
+Let's start over. in the pyramid_transformers.py
+
+1) we read the 3Dmodel*. json
+
+2) we extract points from 0 to 21
+
+3) point 0 is the original position of the frame_pyramid. The orientation R_pyramid is defined by the 3 orthonormal vectors : segment point 0 to 1 defines y direction, 0 to 5 x direction and xis the normal (opposite direction to point 16)
+
+4) extract # Convert to mm
+self.markers_pyramid_frame_mm = np.array(markers) * 1000.0
+
+# Extract local referential (in meters from JSON)
+local_ref_pos = data['LocalReferential']['position']
+local_ref_m = np.array([
+    local_ref_pos['x'],
+    local_ref_pos['y'],
+    local_ref_pos['z']
+])
+
+
+
+Then to pass to the 3Dmodel frame to  optitrack frame 
+
+points 19 to 21 correspond to the constellation in the 3Dmodel frame, which are tracked by optitrack rb_data["Pyramid_RB"][frame_id].data.marker_positions['Marker 001']) marker 001 up to 004. the markers do not match, so we need to define the order. 1) match which marker correspond to which point on the json by comparing the geometric form of the constellation (should be one solution only). to do so, i want a brute force solution to match 2 geometrical form.
+initial guess Marker 002 -> point 20, Marker 003 -> point 19, Marker 001 -> point 21, Marker 004 -> point 18
+
+1) translation : from 0.0 (position 0) to barycentre des points 18, 19, 20, 21
+
+2) rotation : from R_pyramid to optitrack_orientation
+a) estimate and apply rotation de R_pyramid au repère constellation R_constellation ou  Y en direction of point 20 sur le plan des 4 points (point 18 a 21), x sur le plan des 4 points et Z pour former un repere orthonormal
+
+b) apply the rotation r_constellation_to_opt (given as an input)
+
+est ce aue barycentre consistent et correspond ref point ? marker optitrack aleatoire ? 
+
+
