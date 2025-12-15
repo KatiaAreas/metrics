@@ -79,9 +79,9 @@ def complete_workflow_with_visualization(
     # Initial guess from your specification
     initial_guess = {
         'Marker 002': 20,
-        'Marker 003': 19,
+        'Marker 003': 18,
         'Marker 001': 21,
-        'Marker 004': 18
+        'Marker 004': 19
     }
 
     matching = transformer.match_constellation_markers(

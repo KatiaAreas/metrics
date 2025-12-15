@@ -12,8 +12,6 @@ import matplotlib
 matplotlib.use("TkAgg")  # or "Qt5Agg"
 
 import matplotlib.pyplot as plt
-from pyramid_transformer import PyramidTransformer
-from calibrate_pyramid_to_optitrack import complete_workflow_with_visualization
 
 
 def main():
@@ -40,7 +38,7 @@ def main():
         header_path=paths.headers_path,
         data_path=paths.data_path,
         video_timestamps_path=paths.timestamp_path,
-        unit_scale=1.0
+        unit_scale=1.0 #mm sinon 1.0
     )
     print(f"Rigid bodies data loaded successfully. Found {len(rb_data)} data points.")
 
@@ -60,30 +58,12 @@ def main():
         print("Starting pyramid display mode...")
 
         # Define path to pyramid JSON file
-        pyramid_json_path = Path(config.base_data_dir) / "ModelMire3DSLAM2.json"
+        pyramid_json_path = Path(config.base_data_dir) / "ModelMire3DSLAM3.json"
+        vectors_log_path = Path(config.base_data_dir) / "camera_models/vectors.log"
 
         frame=0
         fig, ax,distance, rot_constellation_opti, rot_data = visualize_rigid_body(rb_data, frame_id=frame)
-        # plt.show()
-
-
-
-        # ONE FUNCTION DOES EVERYTHING:
-        transformer, rmse = complete_workflow_with_visualization(
-            rb_data,
-            pyramid_json_path,
-            frame_id=frame,
-            R_constellation_to_optitrack=rot_constellation_opti,  # or None for identity
-            save_plot=True  # Creates constellation_frame.png
-        )
-
-        transformer.plot_constellation_frame(save_path="constellation_frame.png")
-
-
-
-        # Transform points:
-        points_optitrack = transformer.transform_pyramid_to_optitrack(points_pyramid_mm)
-
+        plt.show()
 
 
         display_pyramid(
@@ -92,7 +72,10 @@ def main():
             calib_data=calib_data,
             pyramid_json_path=pyramid_json_path,
             use_notch=(config.angle_detector_type == "notch"),
-            R_const_to_opt=rot_constellation_opti
+            workflow_type="visualization", # or  ranking
+            R_const_to_opt=rot_constellation_opti,
+            vectors_log_path=vectors_log_path,  # Load initial theta from file
+            verify_transformation=True
         )
     else:
         # Display calibration or pen markers

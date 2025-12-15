@@ -1,486 +1,795 @@
-# Métriques de Comparaison de Nuages de Points et Cartes de Profondeur
+# Pyramid Tracking and Visualization System
 
-Toolkit Python complet pour comparer des nuages de points (PLY) et des cartes de profondeur contre des modèles de référence STL.
-
-## 📋 Table des matières
-
-- [Installation](#installation)
-- [Vue d'ensemble](#vue-densemble)
-- [Cas d'usage 1 : Comparaison PLY](#cas-1--comparaison-ply-vs-stl)
-- [Cas d'usage 2 : Comparaison Depth Map](#cas-2--comparaison-depth-map-vs-stl)
-- [Exemples détaillés](#exemples-détaillés)
-- [Métriques disponibles](#métriques-disponibles)
-- [API Reference](#api-reference)
-
-## 🔧 Installation
-
-```bash
-pip install numpy trimesh scipy scikit-learn matplotlib seaborn plyfile
-```
-
-### Dépendances
-
-- `numpy` : Calculs numériques
-- `trimesh` : Manipulation de meshes 3D et fichiers PLY/STL
-- `scipy` : KD-tree pour recherches spatiales
-- `scikit-learn` : Clustering (DBSCAN) et PCA
-- `matplotlib` & `seaborn` : Visualisations
-- `plyfile` : (Optionnel) Lecture alternative de fichiers PLY
-
-## 🎯 Vue d'ensemble
-
-Ce toolkit fournit deux classes principales :
-
-### 1. `PointCloudMetrics`
-Compare un nuage de points accumulé (PLY) contre un modèle STL de référence.
-- **Use case** : Points détectés manuellement par frame qui s'accumulent dans le temps
-- **Problème** : 18 points attendus, mais bruit créant des ellipses/cercles
-- **Métriques** : Dispersion des clusters + Distance au modèle STL
-
-### 2. `DepthMapMetrics`
-Compare une carte de profondeur (depth map) contre un modèle STL.
-- **Use case** : Image de profondeur (n×m) en mm, modèle STL en m
-- **Processus** : Déprojection depth → 3D via matrice [K RT]
-- **Métriques** : Précision, complétude, cartes de chaleur
+## Table of Contents
+1. [Overview](#overview)
+2. [System Architecture](#system-architecture)
+3. [Main Components](#main-components)
+4. [Coordinate Frames](#coordinate-frames)
+5. [Transformation Pipeline](#transformation-pipeline)
+6. [Usage Guide](#usage-guide)
+7. [Verification and Testing](#verification-and-testing)
+8. [Troubleshooting](#troubleshooting)
 
 ---
 
-## 📊 Cas 1 : Comparaison PLY vs STL
+## Overview
 
-### Contexte
-Vous détectez 18 points par frame. Ces points s'accumulent dans le temps pour former un fichier PLY. Idéalement, vous devriez avoir 18 clusters bien définis, mais le bruit crée des dispersions (ellipses/cercles) autour de chaque position théorique.
+This system tracks and visualizes a 3D pyramid geometry in video footage using OptiTrack motion capture data. It performs real-time coordinate transformations from the pyramid's local frame through OptiTrack coordinates to camera image coordinates, with optional notch-based rotation correction.
 
-### Métriques calculées
+### Key Features
+- **Multi-frame coordinate transformation**: Pyramid → OptiTrack → World → Camera → Image
+- **SVD-based alignment**: Automatic computation of transformation matrices using marker correspondences
+- **Real-time visualization**: Video overlay with projected pyramid points
+- **Notch detection**: Optional rotation correction using computer vision
+- **Verification tools**: Built-in validation of transformations
 
-#### 1. **Clustering des points**
-```python
-clusters = metrics.cluster_points(eps=0.005, min_samples=3)
-```
-- Regroupe les points qui devraient représenter la même position
-- `eps` : distance maximale entre points d'un cluster (en mètres)
-- Retourne un dictionnaire avec centroides et points par cluster
+---
 
-#### 2. **Dispersion (quantification du bruit)**
-```python
-dispersion = metrics.compute_cluster_dispersion(clusters)
-```
-
-Pour chaque cluster, calcule :
-- **Écart-type** : Dispersion dans chaque direction (x, y, z)
-- **Distance moyenne au centroïde** : Mesure du bruit global
-- **Distance maximale** : Worst-case du bruit
-- **Axes de l'ellipse** (via PCA) : Dimensions de l'ellipse de dispersion
-- **Ratio d'ellipse** : ellipse_axes[0] / ellipse_axes[1] (circularité)
-
-#### 3. **Distance au modèle STL**
-```python
-distance_metrics = metrics.compute_point_to_surface_metrics(clusters)
-```
-
-- **RMSE** : Root Mean Square Error des distances
-- **MAE** : Mean Absolute Error
-- **Distance moyenne/médiane** : Statistiques centrales
-- **Min/Max** : Plage des erreurs
-
-#### 4. **Métrique combinée**
-```python
-combined = metrics.compute_combined_metric(clusters, dispersion, 
-                                          distance_metrics, alpha=0.5)
-```
-
-Formule : `erreur = α × distance_au_STL + (1-α) × dispersion_moyenne`
-- `α = 0.5` : Poids égal entre précision et bruit
-- `α = 0.7` : Favorise la précision (distance au STL)
-- `α = 0.3` : Favorise la faible dispersion
-
-### Exemple complet
-
-```python
-from point_cloud_metrics import PointCloudMetrics
-import trimesh
-
-# Charger le nuage de points PLY
-ply_mesh = trimesh.load("points_accumules.ply")
-ply_points = ply_mesh.vertices
-
-# Initialiser avec le modèle de référence
-metrics = PointCloudMetrics(ply_points, "modele_reference.stl")
-
-# 1. Clustering
-clusters = metrics.cluster_points(eps=0.005, min_samples=3)
-print(f"Clusters trouvés : {len(clusters)} (attendu : 18)")
-
-# 2. Analyser la dispersion
-dispersion = metrics.compute_cluster_dispersion(clusters)
-for cluster_id, disp in dispersion.items():
-    print(f"Cluster {cluster_id}:")
-    print(f"  Dispersion moyenne : {disp['mean_distance']*1000:.2f} mm")
-    print(f"  Axes ellipse : {disp['ellipse_axes']*1000} mm")
-
-# 3. Distance au STL
-distance_metrics = metrics.compute_point_to_surface_metrics(clusters)
-print(f"\nRMSE au STL : {distance_metrics['rmse']*1000:.3f} mm")
-
-# 4. Rapport complet
-report = metrics.generate_report(clusters)
-print(report)
-
-# 5. Visualisation
-metrics.visualize_clusters(clusters, save_path="clusters.png")
-```
-
-### Sortie typique
+## System Architecture
 
 ```
-Clusters trouvés : 18 (attendu : 18)
-
-Cluster 0:
-  Dispersion moyenne : 2.34 mm
-  Axes ellipse : [3.1, 2.2, 1.8] mm
-  
-RMSE au STL : 1.56 mm
-Métrique combinée : 1.95 mm
+┌─────────────────────────────────────────────────────────────────┐
+│                         INPUT DATA                              │
+├─────────────────────────────────────────────────────────────────┤
+│ • Video file (.mp4)                                             │
+│ • OptiTrack tracking data (rigid bodies)                        │
+│ • Camera calibration (intrinsics, extrinsics)                   │
+│ • Pyramid geometry (JSON with 22 points in pyramid frame)       │
+│ • Initial rotation angle (vectors.log, optional)                │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    COORDINATE TRANSFORMATIONS                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Pyramid Frame → OptiTrack RB → World → Camera → Image         │
+│       (JSON)         (SVD)      (Tracking)  (Calib)  (Project) │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                      OUTPUT VISUALIZATION                       │
+├─────────────────────────────────────────────────────────────────┤
+│ • Real-time video with projected pyramid points                 │
+│ • Point labels and visibility indicators                         │
+│ • Rotation angle display (if using notch detection)            │
+│ • Verification plots and error metrics                          │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 🗺️ Cas 2 : Comparaison Depth Map vs STL
+## Main Components
 
-### Contexte
-Vous avez une carte de profondeur (n×m) en millimètres (valeurs float non normalisées) et un modèle STL en mètres. Vous devez :
-1. Déprojeter la depth map en nuage 3D via les matrices [K RT]
-2. Comparer le nuage 3D au modèle STL
+### 1. `main.py` - Entry Point and Workflow Orchestration
 
-### Pipeline
+**Purpose**: Configures experiment parameters, loads data, and initiates visualization.
 
-```
-Depth Map (mm) → [K, RT] → Point Cloud 3D (m) → Comparaison STL
-```
-
-### Métriques calculées
-
-#### 1. **Déprojection depth → 3D**
+**Key Steps**:
 ```python
-point_cloud = metrics.deproject_depth_to_3d()
-```
-
-Processus :
-- Filtre les pixels invalides (depth = 0 ou NaN)
-- Conversion mm → m via `depth_scale`
-- Utilise K (intrinsèques) pour obtenir (x, y, z) en coordonnées caméra
-- Applique [R|t] pour passer en coordonnées monde
-
-Formule :
-```
-x_cam = (u - cx) × z / fx
-y_cam = (v - cy) × z / fy
-z_cam = z
-
-P_world = R × P_cam + t
-```
-
-#### 2. **Métriques de précision**
-```python
-accuracy = metrics.compute_accuracy_metrics()
-```
-
-- **RMSE** : Erreur quadratique moyenne
-- **MAE** : Erreur absolue moyenne
-- **Percentiles** (95e, 99e) : Distribution des erreurs
-- **Ratio pixels valides** : Couverture de l'image
-
-#### 3. **Complétude (coverage)**
-```python
-completeness = metrics.compute_completeness(threshold=0.01)
-```
-
-Calcule le pourcentage de la surface STL qui est couverte par des points du nuage 3D :
-- Échantillonne uniformément la surface STL
-- Pour chaque point STL, trouve le point le plus proche dans le nuage
-- Compte combien sont dans le seuil de distance
-
-Résultat : `85% de la surface couverte à 10mm près`
-
-#### 4. **Carte de chaleur des erreurs**
-```python
-error_map = metrics.create_error_heatmap(save_path="heatmap.png")
-```
-
-Projette les distances point-to-mesh sur l'image depth originale pour visualiser spatialement les erreurs.
-
-#### 5. **Métriques par région**
-```python
-regions = [
-    (slice(0, h//2), slice(0, w//2)),  # Quadrant haut-gauche
-    ...
-]
-regional_metrics = metrics.compute_regional_metrics(regions)
-```
-
-Calcule les métriques séparément pour différentes zones de l'image (utile si certaines régions sont critiques).
-
-### Exemple complet
-
-```python
-from point_cloud_metrics import DepthMapMetrics
-import numpy as np
-import cv2
-
-# Charger la carte de profondeur (16-bit)
-depth_map = cv2.imread("depth.png", cv2.IMREAD_ANYDEPTH).astype(np.float32)
-
-# Matrice intrinsèque (exemple RealSense D435)
-K = np.array([
-    [615.0, 0, 320.0],
-    [0, 615.0, 240.0],
-    [0, 0, 1]
-])
-
-# Matrice extrinsèque [R|t]
-RT = np.eye(4)
-RT[:3, 3] = [0, 0, 1]  # Translation de 1m en Z
-
-# Initialiser
-metrics = DepthMapMetrics(
-    depth_map=depth_map,
-    K=K,
-    RT=RT,
-    stl_path="modele.stl",
-    depth_scale=1000.0  # mm → m
+# 1. Configure experiment
+config = ExperimentConfig(
+    base_data_dir=Path("..."),
+    experiment_name="pyramid",
+    display_type="pyramid"  # "calib", "pen", or "pyramid"
 )
 
-# 1. Déprojection
-point_cloud = metrics.deproject_depth_to_3d()
-print(f"Points générés : {len(point_cloud)}")
+# 2. Set up file paths
+paths = ExperimentPaths(config)
+paths.validate_paths()
 
-# 2. Précision
-accuracy = metrics.compute_accuracy_metrics()
-print(f"RMSE : {accuracy['rmse']*1000:.2f} mm")
-print(f"MAE : {accuracy['mae']*1000:.2f} mm")
+# 3. Load OptiTrack data
+rb_data = read_data(
+    header_path=paths.headers_path,
+    data_path=paths.data_path,
+    video_timestamps_path=paths.timestamp_path,
+    unit_scale=1.0  # meters
+)
 
-# 3. Complétude
-completeness = metrics.compute_completeness(threshold=0.01)
-print(f"Couverture surface : {completeness['completeness_percentage']:.1f}%")
+# 4. Load camera calibration
+calib_data = CalibData(
+    intrinsics_path=paths.intrinsics_path,
+    extrinsics_path=paths.extrinsics_path,
+    camera_model_path=paths.camera_model_path,
+    ots_ref_pose_path=paths.reference_ots_angle_pose
+)
 
-# 4. Carte de chaleur
-error_map = metrics.create_error_heatmap(save_path="heatmap.png")
-
-# 5. Rapport complet
-report = metrics.generate_report()
-with open("rapport.txt", "w") as f:
-    f.write(report)
+# 5. Display pyramid overlay
+display_pyramid(
+    video_path=paths.video_path,
+    rb_data=rb_data,
+    calib_data=calib_data,
+    pyramid_json_path=pyramid_json_path,
+    use_notch=True,  # Enable notch detection
+    verify_transformation=False  # Set True for verification
+)
 ```
 
-### Sortie typique
+**Configuration Options**:
+- `display_type`: 
+  - `"pyramid"` - Display pyramid points overlay
+  - `"calib"` - Display calibration markers
+  - `"pen"` - Display pen marker
+- `angle_detector_type`: 
+  - `"notch"` - Use notch detection for rotation
+  - `None` - No rotation correction
+- `unit_scale`: 
+  - `1.0` for meters
+  - `1000.0` for millimeters
+
+---
+
+### 2. `utils.py` - Display and Drawing Functions
+
+**Purpose**: Handles video playback, coordinate projection, and overlay rendering.
+
+#### 2.1 `display_pyramid()` - Main Display Loop
+
+**Workflow**:
+```
+1. Load pyramid geometry (PyramidTransformer)
+   ├─ Initialize transformer with JSON
+   ├─ Extract marker positions from OptiTrack data
+   ├─ Match markers to constellation points (18-21)
+   └─ Compute transformation using SVD
+
+2. Optional: Initialize notch detector
+   ├─ Load deep learning models
+   └─ Load initial theta from vectors.log
+
+3. Video playback loop (for each frame):
+   ├─ Read frame from video
+   ├─ Detect notch (if enabled) → compute theta
+   ├─ Compute rotation correction matrix R_cor
+   ├─ Draw pyramid points on frame
+   └─ Display frame with overlays
+```
+
+**Key Parameters**:
+- `video_path`: Path to video file
+- `rb_data`: OptiTrack rigid body tracking data
+- `calib_data`: Camera calibration data
+- `pyramid_json_path`: Path to pyramid geometry JSON
+- `use_notch`: Enable notch-based rotation correction
+- `workflow_type`: "visualization" or "ranking"
+- `verify_transformation`: Enable verification plots
+
+#### 2.2 `draw_pyramid_points()` - Point Projection
+
+**Transformation Pipeline**:
+```python
+# Step 1: Get rigid body poses from OptiTrack
+T_World_Lens = rb_data["Lens_RB"][frame_id].get_transform()
+T_World_Pyramid = rb_data["Pyramid_RB"][frame_id].get_transform()
+
+# Step 2: Compute camera transformation
+RT = np.linalg.inv(T_World_Lens @ calib_data.RT)
+
+# Step 3: Transform points from OptiTrack RB to world frame
+points_hom = np.hstack([points_optitrack_m, np.ones((n_points, 1))])
+points_world_hom = (T_World_Pyramid @ points_hom.T).T
+obj_pts = points_world_hom[:, 0:3]
+
+# Step 4: Project to image coordinates
+proj_marker_2d = cv2.projectPoints(
+    obj_pts,
+    cv2.Rodrigues(RT[:3, :3])[0],
+    RT[:3, 3],
+    calib_data.K,
+    calib_data.dist_coeffs
+)[0]
+
+# Step 5: Apply 2D rotation correction
+homog_marker_2d = np.hstack([proj_marker_2d.reshape(-1, 2), 
+                              np.ones((n_points, 1))]).T
+homog_marker_2d_cor = R_cor @ homog_marker_2d
+
+# Step 6: Draw on frame
+for i in range(n_points):
+    x, y = homog_marker_2d_cor[:2, i].flatten()
+    cv2.circle(frame, (int(x), int(y)), 5, (0, 255, 0), -1)
+    cv2.putText(frame, str(i), (int(x)+8, int(y)-8), ...)
+```
+
+**Color Coding**:
+- Green circles: Pyramid points
+- Yellow text: Point indices
+- Red text: Error messages
+
+---
+
+### 3. `pyramid_transformer.py` - Coordinate Transformation Engine
+
+**Purpose**: Core transformation logic between pyramid frame and OptiTrack frame.
+
+#### 3.1 PyramidTransformer Class
+
+**Initialization**:
+```python
+transformer = PyramidTransformer(json_path)
+# Automatically computes:
+# - Pyramid frame definition (origin, axes)
+# - Constellation frame (points 18-21)
+# - Relative rotation R_pyramid_to_constellation
+```
+
+**Key Attributes**:
+```python
+# Input data (loaded from JSON)
+transformer.points_m              # All 22 points in pyramid frame (Nx3)
+transformer.referential_point_m   # Reference point (if in JSON)
+
+# Pyramid frame definition
+transformer.pyramid_origin_m      # Origin at point 0
+transformer.R_pyramid             # Identity (JSON is in pyramid frame!)
+
+# Constellation frame (points 18-21)
+transformer.constellation_barycenter_m  # Center of 18-21
+transformer.R_constellation             # Rotation matrix
+transformer.constellation_indices       # [18, 19, 20, 21]
+
+# Transformations (computed after marker matching)
+transformer.R_pyramid_to_constellation  # 3x3 rotation
+transformer.R_constellation_to_optitrack # 3x3 rotation (from SVD)
+transformer.R_pyramid_to_optitrack      # 3x3 combined rotation
+transformer.T_pyramid_to_optitrack      # 4x4 homogeneous transform
+```
+
+**Key Methods**:
+
+##### 3.1.1 `compute_optitrack_rotation_from_markers()`
+```python
+R = transformer.compute_optitrack_rotation_from_markers(
+    marker_positions_m,  # Dict: marker_name → position (meters)
+    matching            # Dict: marker_name → point_index
+)
+```
+
+**What it does**:
+1. Extracts constellation points (18-21) in constellation frame
+2. Matches with OptiTrack marker positions
+3. Uses SVD (Kabsch algorithm) to compute optimal rotation
+4. Computes full transformation chain:
+   - `R_constellation_to_optitrack` (from SVD)
+   - `R_pyramid_to_optitrack = R_constellation_to_optitrack @ R_pyramid_to_constellation`
+   - `T_pyramid_to_optitrack` (4x4 with translation)
+
+**SVD Algorithm** (Kabsch):
+```python
+# Center point clouds
+centroid_source = mean(source_points)
+centroid_target = mean(target_points)
+centered_source = source_points - centroid_source
+centered_target = target_points - centroid_target
+
+# Compute covariance matrix
+H = centered_source.T @ centered_target
+
+# SVD decomposition
+U, S, Vt = svd(H)
+
+# Optimal rotation
+R = Vt.T @ U.T
+
+# Handle reflection (ensure det(R) = 1)
+if det(R) < 0:
+    Vt[-1, :] *= -1
+    R = Vt.T @ U.T
+```
+
+##### 3.1.2 `transform_pyramid_to_optitrack()`
+```python
+points_optitrack = transformer.transform_pyramid_to_optitrack(points_pyramid)
+```
+
+**What it does**:
+- Applies full 4x4 transformation: `p_optitrack = T @ [p_pyramid; 1]`
+- Handles rotation and translation
+- Returns points in OptiTrack rigid body frame
+
+##### 3.1.3 Helper Functions
+
+**`extract_marker_positions_from_rb_data()`**:
+```python
+marker_positions_m, rb_position, rb_quaternion = \
+    extract_marker_positions_from_rb_data(rb_data, frame_id=0)
+```
+- Extracts OptiTrack marker positions from tracking data
+- Transforms from world frame to rigid body local frame
+- Returns positions in meters
+
+**`quaternion_to_rotation_matrix()`**:
+```python
+R = quaternion_to_rotation_matrix([x, y, z, w])
+```
+- Converts quaternion to 3x3 rotation matrix
+- Uses scipy if available, otherwise manual computation
+
+---
+
+### 4. Coordinate Frames Explained
+
+#### 4.1 Pyramid Frame (JSON Coordinates)
+
+**Definition**:
+- **Origin**: Point 0
+- **Z axis**: Point 0 → Point 1
+- **X axis**: Perpendicular to Z, in plane formed by points 0, 1, 4
+- **Y axis**: Z × X (right-handed)
+
+**CRITICAL**: The JSON file contains points **already expressed in pyramid frame**:
+- Point 0 is at `[0, 0, 0]`
+- Point 1 is at `[0, 0, z]` (along Z axis)
+- Points are measured in meters
+
+**Usage**:
+```python
+# Points from JSON are ALREADY in pyramid frame
+points_pyramid = transformer.points_m  # Shape: (22, 3)
+
+# No conversion needed! These are pyramid coordinates.
+```
+
+#### 4.2 Constellation Frame (Points 18-21)
+
+**Definition**:
+- **Origin**: Barycenter of points 18, 19, 20, 21 (or referential point if available)
+- **Y axis**: Direction toward point 20 (projected on plane)
+- **Z axis**: Normal to plane of 4 points
+- **X axis**: Y × Z (right-handed, on plane)
+
+**Purpose**: Intermediate frame for marker matching with OptiTrack.
+
+#### 4.3 OptiTrack Frame (Pyramid_RB)
+
+**Definition**:
+- **Origin**: OptiTrack rigid body origin
+- **Axes**: Defined by OptiTrack marker placement
+- Provided by OptiTrack tracking system
+
+**Marker Correspondence**:
+```python
+matching = {
+    'Marker 001': 21,  # OptiTrack marker → JSON point
+    'Marker 002': 20,
+    'Marker 003': 18,
+    'Marker 004': 19
+}
+```
+
+#### 4.4 World Frame (OptiTrack Global)
+
+**Definition**:
+- **Origin**: OptiTrack system origin
+- **Axes**: OptiTrack global coordinate system
+- All rigid bodies are tracked in this frame
+
+#### 4.5 Camera Frame
+
+**Definition**:
+- **Origin**: Camera optical center
+- **Z axis**: Optical axis (looking direction)
+- **X, Y axes**: Image horizontal and vertical
+- Defined by camera calibration
+
+---
+
+## Transformation Pipeline
+
+### Complete Chain
 
 ```
-Points générés : 245,328 / 307,200 pixels
-RMSE : 3.45 mm
-MAE : 2.78 mm
-95e percentile : 8.92 mm
-Couverture surface : 87.3%
+Pyramid Frame (JSON)
+    │
+    │ transformer.points_m (already in pyramid frame)
+    │
+    ↓
+[R_pyramid_to_optitrack, t]  ← Computed by SVD
+    │
+    ↓
+OptiTrack RB Frame (Pyramid_RB local)
+    │
+    │ T_World_Pyramid (from tracking)
+    │
+    ↓
+World Frame (OptiTrack global)
+    │
+    │ RT = inv(T_World_Lens @ calib_data.RT)
+    │
+    ↓
+Camera Frame
+    │
+    │ cv2.projectPoints(K, dist_coeffs)
+    │
+    ↓
+Image Coordinates (pixels)
+    │
+    │ R_cor (notch rotation correction)
+    │
+    ↓
+Corrected Image Coordinates
+```
+
+### Mathematical Formulation
+
+**Step 1: Pyramid → OptiTrack RB**
+```
+p_optitrack = R_pyramid_to_optitrack @ p_pyramid + t_pyramid_to_optitrack
+
+Or in homogeneous coordinates:
+[p_optitrack]   [R_pyramid_to_optitrack | t] [p_pyramid]
+[    1      ] = [        0, 0, 0       | 1] [    1     ]
+```
+
+**Step 2: OptiTrack RB → World**
+```
+p_world = T_World_Pyramid @ [p_optitrack; 1]
+
+Where T_World_Pyramid is from OptiTrack tracking at frame t
+```
+
+**Step 3: World → Camera**
+```
+p_camera = RT @ [p_world; 1]
+
+Where RT = inv(T_World_Lens @ calib_data.RT)
+```
+
+**Step 4: Camera → Image**
+```
+[u]     K @ [R | t] @ p_world
+[v] = ─────────────────────────
+[1]            Z
+
+Using cv2.projectPoints with distortion correction
+```
+
+**Step 5: 2D Rotation Correction** (if notch enabled)
+```
+[u']   [cos(θ)  -sin(θ)  tx] [u]
+[v'] = [sin(θ)   cos(θ)  ty] [v]
+[1 ]   [  0        0      1] [1]
+
+Where θ = initial_theta - detected_theta
 ```
 
 ---
 
-## 📈 Métriques disponibles
+## Usage Guide
 
-### Métriques de dispersion (bruit)
-
-| Métrique | Description | Unité |
-|----------|-------------|-------|
-| `mean_std` | Écart-type moyen dans les 3 dimensions | mm |
-| `mean_distance` | Distance moyenne au centroïde | mm |
-| `max_distance` | Distance maximale au centroïde | mm |
-| `ellipse_axes` | Dimensions de l'ellipse (PCA) | mm |
-| `ellipse_ratio` | Ratio axes[0]/axes[1] (circularité) | - |
-
-### Métriques de précision
-
-| Métrique | Description | Formule |
-|----------|-------------|---------|
-| `RMSE` | Root Mean Square Error | √(Σd²/n) |
-| `MAE` | Mean Absolute Error | Σ\|d\|/n |
-| `Mean` | Distance moyenne | Σd/n |
-| `Median` | Distance médiane | quantile(50%) |
-| `Std` | Écart-type | √(Σ(d-μ)²/n) |
-| `Percentile 95` | 95% des erreurs sous ce seuil | quantile(95%) |
-
-### Métriques de complétude
-
-| Métrique | Description |
-|----------|-------------|
-| `completeness_percentage` | % de surface STL couverte |
-| `covered_points` | Nombre de points STL couverts |
-| `threshold_m` | Seuil de distance utilisé |
-
----
-
-## 🔬 API Reference
-
-### PointCloudMetrics
+### Basic Usage
 
 ```python
-PointCloudMetrics(ply_points: np.ndarray, stl_path: str)
+from pathlib import Path
+from main import main
+
+# Run with default configuration
+main()
 ```
 
-**Méthodes principales :**
-
-- `cluster_points(eps, min_samples)` : Clustering DBSCAN
-- `compute_cluster_dispersion(clusters)` : Calcul dispersion/bruit
-- `compute_point_to_surface_metrics(clusters)` : Distance au STL
-- `compute_combined_metric(clusters, dispersion, distance, alpha)` : Métrique combinée
-- `visualize_clusters(clusters, save_path)` : Visualisation 3D
-- `generate_report(clusters)` : Rapport texte complet
-
-### DepthMapMetrics
+### Custom Configuration
 
 ```python
-DepthMapMetrics(depth_map: np.ndarray, K: np.ndarray, 
-                RT: np.ndarray, stl_path: str, depth_scale: float)
+from pathlib import Path
+from utils import display_pyramid
+from calib_data import CalibData
+from areas_common.data_loading.rigid_body import read_data
+
+# 1. Load data
+rb_data = read_data(
+    header_path="path/to/headers.csv",
+    data_path="path/to/data.csv",
+    video_timestamps_path="path/to/timestamps.csv",
+    unit_scale=1.0  # meters
+)
+
+calib_data = CalibData(
+    intrinsics_path="path/to/intrinsics.json",
+    extrinsics_path="path/to/extrinsics.json",
+    camera_model_path="path/to/camera_model.json",
+    ots_ref_pose_path="path/to/reference_pose.json"
+)
+
+# 2. Display with pyramid overlay
+display_pyramid(
+    video_path=Path("video.mp4"),
+    rb_data=rb_data,
+    calib_data=calib_data,
+    pyramid_json_path=Path("ModelMire3DSLAM3.json"),
+    use_notch=True,
+    workflow_type="visualization",
+    vectors_log_path=Path("vectors.log"),  # Optional: initial rotation
+    verify_transformation=True  # Enable verification plots
+)
 ```
 
-**Méthodes principales :**
-
-- `deproject_depth_to_3d()` : Conversion depth → 3D
-- `compute_accuracy_metrics()` : RMSE, MAE, etc.
-- `compute_completeness(threshold)` : % couverture surface
-- `create_error_heatmap(save_path)` : Carte de chaleur 2D
-- `compute_regional_metrics(regions)` : Métriques par zone
-- `generate_report()` : Rapport texte complet
-
----
-
-## 🎨 Visualisations générées
-
-### 1. Clusters PLY (3D scatter + dispersion + distance STL)
-![Exemple clusters](clusters_visualization.png)
-
-### 2. Carte de chaleur des erreurs depth map
-![Exemple heatmap](error_heatmap.png)
-
----
-
-## 💡 Conseils d'utilisation
-
-### Ajuster les paramètres de clustering
+### Verification Mode
 
 ```python
-# Bruit faible (points précis)
-clusters = metrics.cluster_points(eps=0.003, min_samples=5)
+# Enable comprehensive verification
+display_pyramid(
+    ...,
+    verify_transformation=True
+)
 
-# Bruit élevé (points dispersés)
-clusters = metrics.cluster_points(eps=0.010, min_samples=3)
-```
-
-### Filtrer les outliers
-
-```python
-# Supprimer les clusters avec trop peu de points
-filtered = {k: v for k, v in clusters.items() if v['size'] >= 5}
-```
-
-### Seuils de complétude
-
-```python
-# Strict : 5mm
-completeness_strict = metrics.compute_completeness(threshold=0.005)
-
-# Permissif : 20mm
-completeness_loose = metrics.compute_completeness(threshold=0.020)
-```
-
-### Analyser des régions spécifiques
-
-```python
-# Région centrale (plus importante)
-h, w = depth_map.shape
-center_region = [(slice(h//4, 3*h//4), slice(w//4, 3*w//4))]
-center_metrics = metrics.compute_regional_metrics(center_region)
+# This will show:
+# 1. Constellation frame visualization
+# 2. Distance ranking plots
+# 3. SVD fit quality analysis
+# 4. Interactive 3D visualization
+# 5. Transformation accuracy metrics
 ```
 
 ---
 
-## 📝 Format des fichiers
+## Verification and Testing
 
-### Entrées acceptées
+### Built-in Verification Tools
 
-**PLY** :
-- Format binaire ou ASCII
-- Minimum : vertices (x, y, z)
-- Chargeable via `trimesh` ou `plyfile`
+#### 1. Constellation Frame Visualization
+```python
+transformer.plot_constellation_frame()
+```
+**Shows**:
+- Constellation points (18-21)
+- Barycenter (origin)
+- X, Y, Z axes
+- Plane formed by 4 points
 
-**STL** :
-- Format binaire ou ASCII
-- Échelle : mètres recommandé
+#### 2. Distance Ranking
+```python
+transformer.plot_distance_ranking_with_3d()
+transformer.plot_distance_ranking()
+```
+**Shows**:
+- Distance from each point to referential point
+- 3D scatter plot with color-coded distances
+- Bar chart of sorted distances
 
-**Depth Map** :
-- Array numpy 2D (n×m)
-- Type : `float32` ou `float64`
-- Unité : millimètres (ou spécifier `depth_scale`)
-- Valeurs invalides : 0 ou NaN
+#### 3. SVD Fit Quality
+```python
+from pyramid_transformer import plot_svd_fit_quality
 
-**Matrices** :
-- K : 3×3 (float)
-- RT : 3×4 ou 4×4 (float)
+plot_svd_fit_quality(transformer, marker_positions_m, matching)
+```
+**Shows**:
+- 3D view: transformed vs actual marker positions
+- Point-wise error bars
+- RMSE and error statistics
+
+#### 4. Full Transformation Verification
+```python
+from verification_script import verify_pyramid_transformation
+
+verify_pyramid_transformation(
+    rb_data=rb_data,
+    calib_data=calib_data,
+    transformer=transformer,
+    frame_id=0
+)
+```
+**Checks**:
+- Point visibility in camera frame
+- Projection accuracy
+- Coordinate frame consistency
+- Transformation matrix properties
+
+### Expected Verification Results
+
+**Good SVD Fit**:
+- RMSE < 0.01 m (10mm)
+- Individual errors < 0.02 m (20mm)
+- Uniform error distribution
+
+**Good Projection**:
+- Points within image bounds
+- Consistent with video observations
+- No systematic bias
+
+**Good Transformation**:
+- Determinant of R = 1.0 (orthonormal)
+- R @ R.T = Identity
+- No reflection (right-handed frame)
 
 ---
 
-## 🐛 Dépannage
+## Troubleshooting
 
-### Problème : Trop/pas assez de clusters
+### Common Issues
 
-**Solution** : Ajuster `eps` dans `cluster_points()`
+#### 1. "Cannot import name 'compute_optitrack_rotation_from_markers'"
+
+**Cause**: Trying to import as standalone function instead of class method.
+
+**Solution**:
 ```python
-# Augmenter eps pour fusionner plus de points
-clusters = metrics.cluster_points(eps=0.010)
+# WRONG
+from pyramid_transformer import compute_optitrack_rotation_from_markers
 
-# Réduire eps pour séparer les points
-clusters = metrics.cluster_points(eps=0.003)
+# CORRECT
+from pyramid_transformer import PyramidTransformer
+transformer = PyramidTransformer(json_path)
+R = transformer.compute_optitrack_rotation_from_markers(...)
 ```
 
-### Problème : Erreur "No points in cluster"
+#### 2. "Points not visible in frame"
 
-**Cause** : `min_samples` trop élevé
+**Cause**: Transformation chain is broken or rigid bodies not tracked.
 
-**Solution** :
+**Check**:
 ```python
-clusters = metrics.cluster_points(eps=0.005, min_samples=2)
+# Verify rigid body visibility
+is_pyramid_visible = rb_data["Pyramid_RB"][frame_id].data.is_visible
+is_lens_visible = rb_data["Lens_RB"][frame_id].data.is_visible
+is_cam_visible = rb_data["Cam_RB"][frame_id].data.is_visible
+
+print(f"Pyramid: {is_pyramid_visible}")
+print(f"Lens: {is_lens_visible}")
+print(f"Camera: {is_cam_visible}")
 ```
 
-### Problème : Depth map vide après déprojection
+**Solution**:
+- Ensure all rigid bodies are visible in OptiTrack
+- Check camera calibration
+- Verify frame synchronization
 
-**Causes possibles** :
-1. Mauvaise matrice K (vérifier fx, fy, cx, cy)
-2. Mauvais `depth_scale` (vérifier unités)
-3. Tous les pixels sont invalides (vérifier depth_map > 0)
+#### 3. "High SVD error (RMSE > 0.05m)"
 
-**Debug** :
+**Cause**: Incorrect marker matching or poor OptiTrack data.
+
+**Check**:
 ```python
-print(f"Pixels non-nuls : {np.sum(depth_map > 0)}")
-print(f"Range depth : [{np.min(depth_map[depth_map>0])}, {np.max(depth_map)}]")
+# Verify marker correspondence
+for marker_name, point_idx in matching.items():
+    print(f"{marker_name} → Point {point_idx}")
+
+# Check marker positions
+for name, pos in marker_positions_m.items():
+    print(f"{name}: {pos}")
+```
+
+**Solution**:
+- Double-check marker-to-point matching
+- Verify OptiTrack calibration
+- Check for marker occlusion
+- Try different frame_id for initialization
+
+#### 4. "Rotation correction not working"
+
+**Cause**: Notch not detected or vectors.log missing.
+
+**Check**:
+```python
+# Verify vectors.log exists and is readable
+vectors_log_path = Path("camera_models/vectors.log")
+print(f"Exists: {vectors_log_path.exists()}")
+
+# Check file contents
+with open(vectors_log_path) as f:
+    print(f.read())
+```
+
+**Solution**:
+- Ensure vectors.log contains "Angle: XX.XX" line
+- Wait for first notch detection if file missing
+- Check notch model weights are loaded
+
+#### 5. "Points at wrong location"
+
+**Cause**: Unit scale mismatch (meters vs millimeters).
+
+**Check**:
+```python
+# Check point magnitudes
+print(f"Point 0: {transformer.points_m[0]}")
+print(f"Point 1: {transformer.points_m[1]}")
+
+# Expected: values in range [-1, 1] for meters
+# If values are in range [-1000, 1000], data is in millimeters
+```
+
+**Solution**:
+```python
+# If data is in millimeters:
+rb_data = read_data(..., unit_scale=1000.0)
+
+# If data is in meters:
+rb_data = read_data(..., unit_scale=1.0)
 ```
 
 ---
 
-## 📚 Références
+## File Structure
 
-**Algorithmes utilisés :**
-- DBSCAN clustering : Ester et al. (1996)
-- PCA pour ellipses : Pearson (1901)
-- Point-to-mesh distance : Trimesh library
-- ICP (si nécessaire) : Besl & McKay (1992)
-
-**Métriques standards :**
-- ISO 10360 : Spécifications géométriques des CMM
-- VDI/VDE 2634 : Imagerie optique 3D
+```
+project/
+├── main.py                           # Entry point
+├── utils.py                          # Display and drawing functions
+├── pyramid_transformer.py            # Core transformation logic
+├── verification_script.py            # Verification tools
+├── calib_data.py                     # Camera calibration
+├── config.py                         # Configuration dataclass
+├── paths.py                          # Path management
+│
+├── data/
+│   ├── ModelMire3DSLAM3.json        # Pyramid geometry
+│   ├── video.mp4                    # Video file
+│   ├── optitrack/
+│   │   ├── headers.csv              # OptiTrack headers
+│   │   ├── data.csv                 # OptiTrack data
+│   │   └── timestamps.csv           # Video timestamps
+│   └── camera_models/
+│       ├── intrinsics.json          # Camera intrinsics
+│       ├── extrinsics.json          # Camera extrinsics
+│       ├── camera_model.json        # Distortion model
+│       ├── reference_pose.json      # Reference pose
+│       └── vectors.log              # Initial rotation (optional)
+│
+└── output/
+    ├── verification_plots/          # Verification outputs
+    └── videos/                      # Processed videos
+```
 
 ---
 
-## 📄 Licence
+## API Reference
 
-MIT License - Libre d'utilisation
+### PyramidTransformer
 
-## 🤝 Contribution
+```python
+class PyramidTransformer:
+    def __init__(self, json_path: Path)
+    
+    def compute_optitrack_rotation_from_markers(
+        self,
+        marker_positions_m: Dict[str, np.ndarray],
+        matching: Dict[str, int]
+    ) -> np.ndarray
+    
+    def transform_pyramid_to_optitrack(
+        self,
+        points_pyramid_m: np.ndarray
+    ) -> np.ndarray
+    
+    def get_constellation_points_in_optitrack_frame(
+        self
+    ) -> np.ndarray
+    
+    def match_constellation_markers(
+        self,
+        marker_positions_m: Dict[str, np.ndarray],
+        initial_guess: Optional[Dict[str, int]] = None
+    ) -> Dict[str, int]
+```
 
-N'hésitez pas à ouvrir des issues ou proposer des améliorations !
+### Utils Functions
+
+```python
+def display_pyramid(
+    video_path: Path,
+    rb_data: dict,
+    calib_data: CalibData,
+    pyramid_json_path: Path,
+    use_notch: bool = False,
+    workflow_type: str = "visualization",
+    R_const_to_opt: Optional[np.ndarray] = None,
+    vectors_log_path: Optional[Path] = None,
+    verify_transformation: bool = True
+) -> None
+
+def draw_pyramid_points(
+    frame: np.ndarray,
+    frame_id: int,
+    rb_data: dict,
+    calib_data: CalibData,
+    points_optitrack_m: np.ndarray,
+    R_cor: np.ndarray
+) -> None
+```
+
+---
+
+
+
+
+

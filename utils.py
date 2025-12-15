@@ -1,15 +1,19 @@
 # utils.py
 
-from typing import Any
+
+from typing import Any, Optional
 import cv2
 from pathlib import Path
-from scipy.spatial.transform import Rotation
 import numpy as np
 import numpy.typing as npt
+import re
 
 from calib_data import CalibData
 from areas_theta_compute import NotchAngleComputer, get_default_weights_path
-from pyramid_transformer import PyramidTransformer, extract_marker_positions_from_rb_data
+from calibrate_pyramid_to_optitrack import complete_workflow_with_visualization
+from pyramid_transformer import PyramidTransformer, extract_marker_positions_from_rb_data, plot_svd_fit_quality
+from verification_script import verify_pyramid_transformation, visualize_pyramid_frame_and_points,verif_svd
+
 
 
 def rotation_correction_ccw(theta_degrees, ox, oy):
@@ -64,96 +68,159 @@ def rotation_correction_cw(theta_degrees, ox, oy):
     return rotation_matrix
 
 
+def parse_vectors_log(vectors_log_path: Path) -> Optional[float]:
+    """
+    Parse the vectors.log file to extract the initial theta angle.
+
+    Expected format:
+    "Timestamp: 2025-11-21 16:21:57, RefVector: [1.0, 0.0], Center: (955, 535),
+     Clicked: (384, 632), Vector: [-571, 97], Normalized: [-0.9859, 0.1675], Angle: 170.36"
+
+    Args:
+        vectors_log_path: Path to the vectors.log file
+
+    Returns:
+        Initial theta angle in degrees, or None if parsing fails
+    """
+    if not vectors_log_path.exists():
+        print(f"Warning: vectors.log file not found at {vectors_log_path}")
+        return None
+
+    try:
+        with open(vectors_log_path, 'r') as f:
+            content = f.read()
+
+        # Extract angle using regex
+        # Pattern matches "Angle: " followed by a number (integer or float)
+        angle_match = re.search(r'Angle:\s*(-?\d+\.?\d*)', content)
+
+        if angle_match:
+            initial_theta = float(angle_match.group(1))
+            print(f"✓ Loaded initial theta from vectors.log: {initial_theta:.2f}°")
+            return initial_theta
+        else:
+            print("Warning: Could not find 'Angle:' field in vectors.log")
+            return None
+
+    except Exception as e:
+        print(f"Error parsing vectors.log: {e}")
+        return None
+
 def display_pyramid(
         video_path: Path,
         rb_data: dict[str, Any],
-        calib_data: CalibData,
+        calib_data,  # CalibData type
         pyramid_json_path: Path,
-        use_notch: bool = True,
+        use_notch: bool = False,
+        workflow_type: str = "visualization",  # "visualization" or "ranking"
         R_const_to_opt: npt.NDArray[np.float64] | None = None,
+        vectors_log_path: Optional[Path] = None,
+        verify_transformation: bool = True,
 ) -> None:
     """
-    Display pyramid summits overlaid on video frames.
+    Display pyramid points overlaid on video frames.
 
-    Transforms pyramid summit points from pyramid local frame through OptiTrack
-    frame to camera image frame and displays them on the video.
+    Pipeline:
+    1. Load pyramid geometry (points 0-17 from JSON)
+    2. Transform from pyramid frame to OptiTrack rigid body frame
+    3. For each video frame:
+       a. Transform from OptiTrack rigid body frame to world frame (using Pyramid_RB pose)
+       b. Transform from world frame to camera frame
+       c. Project to image coordinates
+       d. Apply notch rotation correction (optional)
+       e. Draw on frame
 
     Args:
         video_path: Path to the video file
         rb_data: Dictionary containing rigid body tracking data
         calib_data: Camera calibration data
         pyramid_json_path: Path to pyramid geometry JSON file
-        use_notch: Whether to use notch detection for angle estimation
+        use_notch: Whether to use notch detection for angle estimation (default: False)
+        workflow_type: Which workflow to use - "visualization" or "ranking"
+        R_const_to_opt: Rotation from constellation to OptiTrack frame (for visualization workflow)
     """
-    # Load pyramid geometry and get summits in OptiTrack frame
-    points_pyramid = PyramidTransformer(pyramid_json_path)
-    transformer.print_info()
+    # =========================================================================
+    # STEP 1: Load pyramid geometry and compute transformation
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print(f"LOADING PYRAMID GEOMETRY - Using {workflow_type} workflow")
+    print("=" * 70)
 
-    # ========================================================================
-    # STEP 2: Extract OptiTrack data
-    # ========================================================================
-    print("\n[STEP 2] Extracting OptiTrack data...")
+    # 1. Initialize transformer
+    transformer = PyramidTransformer(pyramid_json_path)
 
-    marker_positions_local_mm, rb_position_m, rb_quaternion = \
-        extract_marker_positions_from_rb_data(rb_data, frame_id)
-
-    print(f"\nRigid body pose (world frame):")
-    print(f"  Position: {rb_position_m} m")
-    print(f"  Quaternion [x,y,z,w]: {rb_quaternion}")
-
-    print(f"\nMarker positions (constellation local frame, mm):")
-    for name, pos in marker_positions_local_mm.items():
-        print(f"  {name}: {pos}")
-
-    # ========================================================================
-    # STEP 3: Match constellation markers
-    # ========================================================================
-    print("\n[STEP 3] Matching constellation markers...")
-
-    # Initial guess (you provided this)
-    initial_guess = {
-        'Marker 002': 20,
-        'Marker 003': 19,
-        'Marker 001': 21,
-        'Marker 004': 18
-    }
-
-    # Brute force matching (will verify initial guess or find better match)
-    matching = transformer.match_constellation_markers(
-        marker_positions_local_mm,
-        initial_guess
+    # 2. Extract OptiTrack marker positions
+    marker_positions_m, rb_position_m, rb_quaternion = extract_marker_positions_from_rb_data(
+        rb_data,
+        frame_id=0
     )
 
-
-
-    # Extract marker positions from rb_data:
-    marker_pos, rb_pos, rb_quat = extract_marker_positions_from_rb_data(rb_data)
-    # Match constellation markers:
-    initial_guess = {
+    # 3. Define your known matching
+    matching = {
         'Marker 002': 20,
-        'Marker 003': 19,
         'Marker 001': 21,
-        'Marker 004': 18
+        'Marker 003': 18,
+        'Marker 004': 19
     }
-    matching = transformer.match_constellation_markers(marker_pos, initial_guess)
-    # Set OptiTrack rotation:
-    transformer.set_optitrack_rotation(R_const_to_opt)
+
+    # 4. Compute rotation using SVD
+    R_constellation_to_optitrack = transformer.compute_optitrack_rotation_from_markers(
+        marker_positions_m,
+        matching
+    )
+    R_pyramid_to_optitrack = transformer.R_pyramid_to_optitrack
+
+    T_pyramid_to_optitrack = transformer.T_pyramid_to_optitrack  # 4x4 with translation
+
+    # Get all points and convert: world → pyramid → OptiTrack
+    points_world = transformer.points_m  # All 22 points
+
+    # World → pyramid frame
+    R_pyramid = transformer.R_pyramid
+    pyramid_origin = transformer.pyramid_origin_m
+    points_pyramid = (R_pyramid.T @ (points_world - pyramid_origin).T).T
+
+    # Pyramid → OptiTrack frame
+    points_optitrack = transformer.transform_pyramid_to_optitrack(points_pyramid)
+
+    # Transform points from pyramid frame to OptiTrack frame
     points_optitrack = transformer.transform_pyramid_to_optitrack(points_pyramid)
 
 
-    # Open video
-    cap = cv2.VideoCapture(str(video_path))
+    ####################### Test transforms##################################
+    if verify_transformation:
+        transformer.plot_constellation_frame()
+        sorted_points, distances, point_indices, sorted_idx, sorted_distances=transformer.plot_distance_ranking_with_3d()
+        transformer.plot_distance_ranking()
+        verif_svd(rb_data,pyramid_json_path)
 
-    if not cap.isOpened():
-        print(f"Error: Could not open video file at {video_path}")
-        return
+        visualize_pyramid_frame_and_points(transformer, interactive=True, save_path=None)
 
-    # Get camera center for rotation correction
-    camera_center_x: float = calib_data.camera_model.get_center()[0]
-    camera_center_y: float = calib_data.camera_model.get_center()[1]
+        verify_pyramid_transformation(
+            rb_data=rb_data,
+            calib_data=calib_data,
+            transformer=transformer,
+            frame_id=0
+        )
 
-    # Initialize notch detector if needed
+    ########################################
+
+    # =========================================================================
+    # STEP 2: Initialize notch detector if needed
+    # =========================================================================
+    notch_computer = None
+    initial_theta = None
+
+    # Load initial theta from vectors.log if provided
+    if vectors_log_path is not None:
+        initial_theta = parse_vectors_log(vectors_log_path)
+        if initial_theta is None:
+            print("Warning: Failed to load initial theta from vectors.log")
+            if use_notch:
+                print("         Will wait for first notch detection to set initial theta")
+
     if use_notch:
+        print("\nInitializing notch detector...")
         notch_computer = NotchAngleComputer(
             notch_model="pose",
             circle_method="hough",
@@ -163,82 +230,121 @@ def display_pyramid(
             notch_model_path=str(get_default_weights_path()),
             device="auto"
         )
-        initial_theta = 170
+        print("✓ Notch detector initialized")
 
-    print("Starting video playback. Press 'q' to quit.")
+        if initial_theta is not None:
+            print(f"✓ Using initial theta from vectors.log: {initial_theta:.2f}°")
+        else:
+            print("⚠ No initial theta loaded - will use first detection")
+
+    # Get camera center for rotation correction
+    camera_center_x: float = calib_data.camera_model.get_center()[0]
+    camera_center_y: float = calib_data.camera_model.get_center()[1]
+
+    # =========================================================================
+    # STEP 3: Open video and start playback
+    # =========================================================================
+    cap = cv2.VideoCapture(str(video_path))
+
+    if not cap.isOpened():
+        print(f"Error: Could not open video file at {video_path}")
+        return
+
+    print("\nStarting video playback. Press 'q' to quit.")
+    if use_notch:
+        print("Notch detection: ENABLED")
+        if initial_theta is not None:
+            print(f"Initial theta: {initial_theta:.2f}° (from vectors.log)")
+        else:
+            print("Initial theta: Will be set on first detection")
+    else:
+        print("Notch detection: DISABLED (theta = 0)")
 
     # Define the starting frame ID
     start_frame_id: int = 0
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame_id)
     frame_id: int = start_frame_id
 
-    # Track whether we have a valid notch detection
     notch_visible = False
 
+    # =========================================================================
+    # STEP 4: Video playback loop
+    # =========================================================================
     while True:
         ret, frame = cap.read()
         if not ret:
             print("End of video.")
             break
 
-        # Estimate rotation angle using notch detector
+        # =====================================================================
+        # Compute theta (rotation angle) from notch detector
+        # =====================================================================
         if use_notch:
             # Process the frame using NotchAngleComputer
             results = notch_computer.run(images=[frame], angle_unit="degrees")
 
-            # Check visibility and extract angle from results
             if results and len(results) > 0:
                 result = results[0]
 
-                # Update initial_theta if not set and notch is visible
+                # Set initial theta on first successful detection
                 if initial_theta is None and result.visibility == 1 and result.success and result.angle is not None:
                     initial_theta = result.angle
                     print(f"Initial theta set from first detection: {initial_theta:.2f} degrees")
 
-                # Calculate theta relative to initial position
-                if result.visibility == 1 and initial_theta is not None and result.success and result.angle is not None:
+                # Compute relative angle
+                if result.visibility == 1 and initial_theta is not None:
                     theta = initial_theta - result.angle
                     notch_visible = True
                 else:
                     theta = 0.0
                     notch_visible = False
 
+                    # Draw warning messages
                     if initial_theta is None:
                         cv2.putText(frame, "Waiting for initial notch detection",
                                     (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
                     else:
-                        cv2.putText(frame, "Cannot detect notch - no points displayed",
+                        cv2.putText(frame, "Cannot detect notch",
                                     (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-            else:
-                theta = 0.0
-                notch_visible = False
-                cv2.putText(frame, "Cannot detect notch - no points displayed",
-                            (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
         else:
-            # Without notch, assume no rotation
             theta = 0.0
             notch_visible = True
 
         # Compute rotation correction matrix
         R_cor = rotation_correction_cw(theta, camera_center_x, camera_center_y)
 
-        # Only draw pyramid points if notch is visible
-        if notch_visible:
-            draw_pyramid_summits(
+        # =====================================================================
+        # Draw pyramid points (only if notch is visible when using notch mode)
+        # =====================================================================
+        should_draw = True
+        if use_notch and not notch_visible:
+            should_draw = False
+
+        if should_draw:
+            draw_pyramid_points(
                 frame,
                 frame_id,
                 rb_data,
                 calib_data,
-                summits_optitrack_frame,
-                R_cor
+                points_optitrack,
+                R_cor=R_cor
             )
 
-        # Display the theta value in the top left corner
+        # Display theta information
         cv2.putText(frame, f"Theta: {theta:.2f} deg / {np.deg2rad(theta):.2f} rad",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
+        cv2.putText(frame, f"Workflow: {workflow_type}",
+                    (10, frame.shape[0] - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+        # Display initial theta source
+        if use_notch and initial_theta is not None:
+            theta_source = "vectors.log" if vectors_log_path is not None else "first detection"
+            cv2.putText(frame, f"Init theta: {initial_theta:.2f}deg ({theta_source})",
+                        (10, frame.shape[0] - 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
         # Display the frame
-        cv2.imshow("Pyramid Summit Overlay", frame)
+        cv2.imshow("Pyramid Points Overlay", frame)
 
         # Wait for key press (16ms ≈ 60fps)
         if cv2.waitKey(16) & 0xFF == ord('q'):
@@ -252,23 +358,24 @@ def display_pyramid(
     cv2.destroyAllWindows()
 
 
-def draw_pyramid_summits(
+def draw_pyramid_points(
         frame: np.ndarray,
         frame_id: int,
         rb_data: dict[str, Any],
-        calib_data: CalibData,
-        summits_optitrack: np.ndarray,
+        calib_data,  # CalibData type
+        points_optitrack_m: np.ndarray,
         R_cor: np.ndarray
 ) -> None:
     """
-    Draw pyramid summit points on the video frame.
+    Draw pyramid points on the video frame.
+    Uses the SAME transformation pipeline as the validated draw_marker function.
 
-    Pipeline:
+    Pipeline (following validated draw_marker):
     1. Get Pyramid_RB pose in world frame (from OptiTrack tracking)
-    2. Transform summits from OptiTrack rigid body frame to world frame
-    3. Transform from world to camera frame
-    4. Project to image coordinates
-    5. Apply rotation correction
+    2. Transform points from OptiTrack rigid body frame to world frame
+    3. Transform from world frame to camera frame using validated RT matrix
+    4. Project to image coordinates using cv2.projectPoints
+    5. Apply rotation correction (R_cor) to 2D homogeneous coordinates
     6. Draw on frame
 
     Args:
@@ -276,8 +383,8 @@ def draw_pyramid_summits(
         frame_id: Current frame index
         rb_data: Dictionary containing rigid body tracking data
         calib_data: Camera calibration data
-        summits_optitrack: Summit positions in OptiTrack rigid body frame (Nx3)
-        R_cor: 3x3 rotation correction matrix for image plane
+        points_optitrack_m: Point positions in OptiTrack rigid body frame (Nx3, meters)
+        R_cor: 3x3 rotation correction matrix for 2D homogeneous coordinates
     """
     # Check if all required rigid bodies are visible
     is_lens_visible = rb_data["Lens_RB"][frame_id].data.is_visible
@@ -285,70 +392,92 @@ def draw_pyramid_summits(
     is_pyramid_visible = rb_data["Pyramid_RB"][frame_id].data.is_visible
 
     if not (is_cam_visible and is_lens_visible and is_pyramid_visible):
-        # Draw a message if pyramid is not visible
+        # Draw visibility warnings
         if not is_pyramid_visible:
             cv2.putText(frame, "Pyramid not visible in OptiTrack",
                         (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        if not is_lens_visible:
+            cv2.putText(frame, "Lens not visible in OptiTrack",
+                        (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        if not is_cam_visible:
+            cv2.putText(frame, "Camera not visible in OptiTrack",
+                        (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         return
 
     try:
-        # Step 1: Get transformation matrices
-        # T_World_Pyramid: Pyramid rigid body pose in world frame
+        # =====================================================================
+        # STEP 1: Get transformation matrices (SAME AS VALIDATED draw_marker)
+        # =====================================================================
+        T_World_Lens = rb_data["Lens_RB"][frame_id].get_transform()
         T_World_Pyramid = rb_data["Pyramid_RB"][frame_id].get_transform()
 
-        # T_World_Lens: Camera lens pose in world frame
-        T_World_Lens = rb_data["Lens_RB"][frame_id].get_transform()
-
-        # Step 2: Transform summits from OptiTrack rigid body frame to world frame
-        # summits_world = T_World_Pyramid @ summits_optitrack
-        n_summits = summits_optitrack.shape[0]
-        summits_hom = np.hstack([summits_optitrack, np.ones((n_summits, 1))])
-        summits_world = (T_World_Pyramid @ summits_hom.T).T[:, 0:3]
-
-        # Step 3: Transform from world to camera frame
-        # RT is the extrinsic camera calibration (camera to lens rigid body)
-        # T_Cam_World = inv(T_World_Lens @ RT)
+        # RT matrix: same calculation as validated draw_marker
         RT = np.linalg.inv(T_World_Lens @ calib_data.RT)
 
-        # Step 4: Project summits to image coordinates
-        proj_summits_2d = cv2.projectPoints(
-            summits_world,
+        # =====================================================================
+        # STEP 2: Transform points to world frame
+        # =====================================================================
+        # points_optitrack_m are in Pyramid_RB local frame (meters)
+        # Transform: points_world = T_World_Pyramid @ [points | 1]
+        n_points = points_optitrack_m.shape[0]
+        points_hom = np.hstack([points_optitrack_m, np.ones((n_points, 1))])  # Nx4
+        points_world_hom = (T_World_Pyramid @ points_hom.T).T  # Nx4
+        obj_pts = points_world_hom[:, 0:3]  # Nx3 - same format as draw_marker
+
+        # =====================================================================
+        # STEP 3: Project to image coordinates (SAME AS VALIDATED draw_marker)
+        # =====================================================================
+        proj_marker_2d = cv2.projectPoints(
+            obj_pts,
             cv2.Rodrigues(RT[:3, :3])[0],
             RT[:3, 3],
             calib_data.K,
             calib_data.dist_coeffs
         )[0]
 
-        # Step 5: Apply rotation correction
-        # Convert to homogeneous 2D coordinates
-        homog_summits_2d = np.hstack([
-            proj_summits_2d.reshape(-1, 2),
-            np.ones((proj_summits_2d.shape[0], 1))
-        ]).T
+        # =====================================================================
+        # STEP 4: Apply rotation correction (SAME AS VALIDATED draw_marker)
+        # =====================================================================
+        # Get homogeneous 2D marker positions
+        homog_marker_2d = np.hstack([proj_marker_2d.reshape(-1, 2), np.ones((proj_marker_2d.shape[0], 1))]).T
 
-        # Apply rotation correction
-        homog_summits_2d_cor = R_cor @ homog_summits_2d
+        # Apply correction
+        homog_marker_2d_cor = R_cor @ homog_marker_2d
 
-        # Step 6: Draw corrected summit positions
-        for i in range(homog_summits_2d_cor.shape[1]):
-            x, y = homog_summits_2d_cor[:2, i].flatten()
-            x_int, y_int = int(round(x)), int(round(y))
+        # =====================================================================
+        # STEP 5: Draw points on frame (SAME AS VALIDATED draw_marker)
+        # =====================================================================
+        if homog_marker_2d_cor is not None:
+            try:
+                points_in_frame = 0
+                for i in range(homog_marker_2d_cor.shape[1]):
+                    x, y = homog_marker_2d_cor[:2, i].flatten()
+                    x_int, y_int = int(round(x)), int(round(y))
 
-            # Check if point is within frame bounds
-            if 0 <= x_int < frame.shape[1] and 0 <= y_int < frame.shape[0]:
-                # Draw the summit point
-                cv2.circle(frame, (x_int, y_int), 5, (0, 255, 0), -1)  # Green filled circle
+                    # Check if point is within frame bounds
+                    if 0 <= x_int < frame.shape[1] and 0 <= y_int < frame.shape[0]:
+                        points_in_frame += 1
 
-                # Draw the summit index number
-                cv2.putText(frame, str(i), (x_int + 8, y_int - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                        # Draw the point (green circle)
+                        cv2.circle(frame, (x_int, y_int), 5, (0, 255, 0), -1)
 
-        # Draw info text
-        cv2.putText(frame, f"Pyramid summits: {n_summits} points visible",
-                    (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                        # Draw the point index number
+                        cv2.putText(frame, str(i), (x_int + 8, y_int - 8),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+
+                # Draw info text
+                cv2.putText(frame, f"Pyramid points: {points_in_frame}/{n_points} visible",
+                            (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+            except Exception as e:
+                print(f"Error drawing pyramid points at frame {frame_id}: {e}")
+                cv2.putText(frame, f"Draw error: {str(e)[:30]}",
+                            (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
     except Exception as e:
-        print(f"Error drawing pyramid summits: {e}")
+        print(f"Error in draw_pyramid_points at frame {frame_id}: {e}")
+        import traceback
+        traceback.print_exc()
         cv2.putText(frame, f"Error: {str(e)[:50]}",
                     (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
@@ -476,6 +605,7 @@ def draw_marker(
 ) -> None:
     """
     Draw calibration markers on the frame.
+    This is the VALIDATED function that works correctly.
 
     Args:
         frame: Video frame to draw on.
@@ -516,3 +646,40 @@ def draw_marker(
                                -1)
             except Exception as e:
                 print(f"Error drawing marker: {e}")
+
+
+# ==============================================================================
+# USAGE EXAMPLES:
+# ==============================================================================
+"""
+from pathlib import Path
+from utils import display_pyramid
+
+# Test both workflows
+video_path = Path("your_video.mp4")
+rb_data = your_rb_data
+calib_data = your_calib_data
+pyramid_json_path = Path("ModelMire3DSLAM.json")
+
+# Test workflow 1: visualization
+display_pyramid(
+    video_path=video_path,
+    rb_data=rb_data,
+    calib_data=calib_data,
+    pyramid_json_path=pyramid_json_path,
+    use_notch=True,  # Enable notch detection
+    workflow_type="visualization",
+    R_const_to_opt=None
+)
+
+# Test workflow 2: ranking
+display_pyramid(
+    video_path=video_path,
+    rb_data=rb_data,
+    calib_data=calib_data,
+    pyramid_json_path=pyramid_json_path,
+    use_notch=True,  # Enable notch detection
+    workflow_type="ranking",
+    R_const_to_opt=None
+)
+"""
