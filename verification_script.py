@@ -132,21 +132,21 @@ def verify_pyramid_transformation(
                 print(f"\n  Point {idx} ↔ {marker_name}:")
                 print(f"    Computed:  {computed}")
                 print(f"    Measured:  {measured}")
-                print(f"    Error:     {error:.4f} m")
+                print(f"    Error:     {error:.4f} mm")
         
         if errors:
             rmse = np.sqrt(np.mean(np.array(errors) ** 2))
             max_error = np.max(errors)
             
-            print(f"\nRMSE:       {rmse:.4f} m")
-            print(f"Max error:  {max_error:.4f} m")
+            print(f"\nRMSE:       {rmse:.4f} mm")
+            print(f"Max error:  {max_error:.4f} mm")
             
             if rmse < 5.0:
-                print("✓ PASSED: RMSE < 5m")
+                print("✓ PASSED: RMSE < 5mm")
             elif rmse < 10.0:
-                print("⚠️  WARNING: RMSE < 10m but > 5m")
+                print("⚠️  WARNING: RMSE < 10m but > 5mm")
             else:
-                print("❌ FAILED: RMSE > 10m")
+                print("❌ FAILED: RMSE > 10mm")
                 # return False
     else:
         print("\n⚠️  No marker matching available - skip comparison")

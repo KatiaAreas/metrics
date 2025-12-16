@@ -60,6 +60,7 @@ def main():
         # Define path to pyramid JSON file
         pyramid_json_path = Path(config.base_data_dir) / "ModelMire3DSLAM3.json"
         vectors_log_path = Path(config.base_data_dir) / "camera_models/vectors.log"
+        keypoints_json_path = Path(config.base_data_dir) / "pyramid_ppoints/pyramid_points_coordinates.json"
 
         frame=0
         fig, ax,distance, rot_constellation_opti, rot_data = visualize_rigid_body(rb_data, frame_id=frame)
@@ -71,6 +72,7 @@ def main():
             rb_data=rb_data,
             calib_data=calib_data,
             pyramid_json_path=pyramid_json_path,
+            keypoints_json_path=keypoints_json_path,
             use_notch=(config.angle_detector_type == "notch"),
             R_const_to_opt=rot_constellation_opti,
             vectors_log_path=vectors_log_path,  # Load initial theta from file

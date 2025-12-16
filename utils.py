@@ -7,13 +7,35 @@ from pathlib import Path
 import numpy as np
 import numpy.typing as npt
 import re
+import json
 
 from calib_data import CalibData
 from areas_theta_compute import NotchAngleComputer, get_default_weights_path
 from calibrate_pyramid_to_optitrack import complete_workflow_with_visualization
 from pyramid_transformer import PyramidTransformer, extract_marker_positions_from_rb_data, plot_svd_fit_quality
-from verification_script import verify_pyramid_transformation, visualize_pyramid_frame_and_points,verif_svd
+from verification_script import verify_pyramid_transformation, visualize_pyramid_frame_and_points, verif_svd
 
+
+def load_keypoints_from_json(json_path: Path) -> dict:
+    """
+    Load 2D keypoints from JSON file.
+
+    Args:
+        json_path: Path to the JSON file containing keypoint data
+
+    Returns:
+        Dictionary mapping frame_id to list of keypoints
+        Format: {frame_id: [{id, x, y, visibility}, ...]}
+    """
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+
+    keypoints_dict = {}
+    for frame in data['frames']:
+        frame_id = frame['frame_id']
+        keypoints_dict[frame_id] = frame['keypoints']
+
+    return keypoints_dict
 
 
 def rotation_correction_ccw(theta_degrees, ox, oy):
@@ -106,11 +128,56 @@ def parse_vectors_log(vectors_log_path: Path) -> Optional[float]:
         print(f"Error parsing vectors.log: {e}")
         return None
 
+
+def draw_keypoints_on_frame(
+        frame: np.ndarray,
+        keypoints: list,
+        color: tuple = (255, 0, 0),  # Blue color for keypoints (BGR)
+        radius: int = 3,
+        show_ids: bool = True
+) -> int:
+    """
+    Draw 2D keypoints on the frame.
+
+    Args:
+        frame: Video frame to draw on
+        keypoints: List of keypoint dictionaries with keys: id, x, y, visibility
+        color: BGR color tuple for keypoints (default: blue)
+        radius: Radius of keypoint circles
+        show_ids: Whether to show keypoint IDs as text
+
+    Returns:
+        Number of visible keypoints drawn
+    """
+    visible_count = 0
+
+    for kp in keypoints:
+        # Check visibility (typically 0=not visible, 1=occluded, 2=visible)
+        if kp.get('visibility', 2) > 0:
+            x = int(round(kp['x']))
+            y = int(round(kp['y']))
+
+            # Check if point is within frame bounds
+            if 0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]:
+                # Draw keypoint circle
+                cv2.circle(frame, (x, y), radius, color, -1)
+
+                # Draw keypoint ID
+                if show_ids:
+                    cv2.putText(frame, str(kp['id']), (x + 5, y - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
+
+                visible_count += 1
+
+    return visible_count
+
+
 def display_pyramid(
         video_path: Path,
         rb_data: dict[str, Any],
         calib_data,  # CalibData type
         pyramid_json_path: Path,
+        keypoints_json_path: Optional[Path] = None,  # NEW PARAMETER
         use_notch: bool = False,
         R_const_to_opt: npt.NDArray[np.float64] | None = None,
         vectors_log_path: Optional[Path] = None,
@@ -118,6 +185,8 @@ def display_pyramid(
 ) -> None:
     """
     Display pyramid points overlaid on video frames.
+
+    NEW: Can also display 2D keypoints from a separate JSON file alongside pyramid points.
 
     Pipeline:
     1. Load pyramid geometry (points 0-17 from JSON)
@@ -127,15 +196,19 @@ def display_pyramid(
        b. Transform from world frame to camera frame
        c. Project to image coordinates
        d. Apply notch rotation correction (optional)
-       e. Draw on frame
+       e. Draw pyramid points on frame
+       f. Draw 2D keypoints on frame (if provided)
 
     Args:
         video_path: Path to the video file
         rb_data: Dictionary containing rigid body tracking data
         calib_data: Camera calibration data
         pyramid_json_path: Path to pyramid geometry JSON file
+        keypoints_json_path: Path to 2D keypoints JSON file (optional)
         use_notch: Whether to use notch detection for angle estimation (default: False)
         R_const_to_opt: Rotation from constellation to OptiTrack frame
+        vectors_log_path: Path to vectors.log file for initial theta
+        verify_transformation: Whether to run verification plots
     """
     # =========================================================================
     # STEP 1: Load pyramid geometry and compute transformation
@@ -169,6 +242,7 @@ def display_pyramid(
     R_pyramid_to_optitrack = transformer.R_pyramid_to_optitrack
 
     T_pyramid_to_optitrack = transformer.T_pyramid_to_optitrack  # 4x4 with translation
+    print('T_pyramid_to_optitrack = ', T_pyramid_to_optitrack)
 
     # Get all points and convert: world → pyramid → OptiTrack
     points_world = transformer.points_m  # All 22 points
@@ -186,7 +260,7 @@ def display_pyramid(
         transformer.plot_constellation_frame()
         # sorted_points, distances, point_indices, sorted_idx, sorted_distances=transformer.plot_distance_ranking_with_3d()
         # transformer.plot_distance_ranking()
-        verif_svd(rb_data,pyramid_json_path)
+        verif_svd(rb_data, pyramid_json_path)
 
         visualize_pyramid_frame_and_points(transformer, interactive=True, save_path=None)
 
@@ -198,6 +272,22 @@ def display_pyramid(
         )
 
     ########################################
+
+    # =========================================================================
+    # STEP 1.5: Load 2D keypoints if provided (NEW)
+    # =========================================================================
+    keypoints_dict = None
+    if keypoints_json_path is not None:
+        print("\n" + "=" * 70)
+        print(f"LOADING 2D KEYPOINTS")
+        print("=" * 70)
+        try:
+            keypoints_dict = load_keypoints_from_json(keypoints_json_path)
+            print(f"✓ Loaded keypoints for {len(keypoints_dict)} frames")
+            print(f"✓ Number of keypoints per frame: {len(keypoints_dict[list(keypoints_dict.keys())[0]])}")
+        except Exception as e:
+            print(f"Error loading keypoints: {e}")
+            keypoints_dict = None
 
     # =========================================================================
     # STEP 2: Initialize notch detector if needed
@@ -253,6 +343,9 @@ def display_pyramid(
             print("Initial theta: Will be set on first detection")
     else:
         print("Notch detection: DISABLED (theta = 0)")
+
+    if keypoints_dict is not None:
+        print("2D Keypoints: ENABLED (will be drawn in BLUE)")
 
     # Define the starting frame ID
     start_frame_id: int = 0
@@ -324,10 +417,26 @@ def display_pyramid(
                 R_cor=R_cor
             )
 
+        # =====================================================================
+        # Draw 2D keypoints (NEW)
+        # =====================================================================
+        if keypoints_dict is not None and frame_id in keypoints_dict:
+            keypoints = keypoints_dict[frame_id]
+            visible_kp_count = draw_keypoints_on_frame(
+                frame,
+                keypoints,
+                color=(255, 0, 0),  # Blue for keypoints
+                radius=3,
+                show_ids=True
+            )
+
+            # Display keypoint info
+            cv2.putText(frame, f"2D Keypoints: {visible_kp_count}/{len(keypoints)} visible",
+                        (10, frame.shape[0] - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+
         # Display theta information
         cv2.putText(frame, f"Theta: {theta:.2f} deg / {np.deg2rad(theta):.2f} rad",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
 
         # Display initial theta source
         if use_notch and initial_theta is not None:
@@ -647,29 +756,26 @@ def draw_marker(
 from pathlib import Path
 from utils import display_pyramid
 
-# Test both workflows
+# Example with 2D keypoints visualization
 video_path = Path("your_video.mp4")
 rb_data = your_rb_data
 calib_data = your_calib_data
 pyramid_json_path = Path("ModelMire3DSLAM.json")
+keypoints_json_path = Path("pyramid_0_keypoints.json")  # NEW
 
-# Test workflow 1: visualization
+# Display pyramid with 2D keypoints overlay
 display_pyramid(
     video_path=video_path,
     rb_data=rb_data,
     calib_data=calib_data,
     pyramid_json_path=pyramid_json_path,
-    use_notch=True,  # Enable notch detection
+    keypoints_json_path=keypoints_json_path,  # NEW: Add keypoints
+    use_notch=True,
     R_const_to_opt=None
 )
 
-# Test workflow 2: ranking
-display_pyramid(
-    video_path=video_path,
-    rb_data=rb_data,
-    calib_data=calib_data,
-    pyramid_json_path=pyramid_json_path,
-    use_notch=True,  # Enable notch detection
-    R_const_to_opt=None
-)
+# The visualization will show:
+# - GREEN circles: Projected 3D pyramid points
+# - BLUE circles: 2D detected keypoints from JSON
+# Both with their respective IDs and visibility counts
 """
