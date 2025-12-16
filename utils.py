@@ -112,7 +112,6 @@ def display_pyramid(
         calib_data,  # CalibData type
         pyramid_json_path: Path,
         use_notch: bool = False,
-        workflow_type: str = "visualization",  # "visualization" or "ranking"
         R_const_to_opt: npt.NDArray[np.float64] | None = None,
         vectors_log_path: Optional[Path] = None,
         verify_transformation: bool = True,
@@ -136,14 +135,13 @@ def display_pyramid(
         calib_data: Camera calibration data
         pyramid_json_path: Path to pyramid geometry JSON file
         use_notch: Whether to use notch detection for angle estimation (default: False)
-        workflow_type: Which workflow to use - "visualization" or "ranking"
-        R_const_to_opt: Rotation from constellation to OptiTrack frame (for visualization workflow)
+        R_const_to_opt: Rotation from constellation to OptiTrack frame
     """
     # =========================================================================
     # STEP 1: Load pyramid geometry and compute transformation
     # =========================================================================
     print("\n" + "=" * 70)
-    print(f"LOADING PYRAMID GEOMETRY - Using {workflow_type} workflow")
+    print(f"LOADING PYRAMID GEOMETRY")
     print("=" * 70)
 
     # 1. Initialize transformer
@@ -180,18 +178,14 @@ def display_pyramid(
     pyramid_origin = transformer.pyramid_origin_m
     points_pyramid = (R_pyramid.T @ (points_world - pyramid_origin).T).T
 
-    # Pyramid → OptiTrack frame
+    # Pyramid → OptiTrack frame : Transform points from pyramid frame to OptiTrack frame
     points_optitrack = transformer.transform_pyramid_to_optitrack(points_pyramid)
-
-    # Transform points from pyramid frame to OptiTrack frame
-    points_optitrack = transformer.transform_pyramid_to_optitrack(points_pyramid)
-
 
     ####################### Test transforms##################################
     if verify_transformation:
         transformer.plot_constellation_frame()
-        sorted_points, distances, point_indices, sorted_idx, sorted_distances=transformer.plot_distance_ranking_with_3d()
-        transformer.plot_distance_ranking()
+        # sorted_points, distances, point_indices, sorted_idx, sorted_distances=transformer.plot_distance_ranking_with_3d()
+        # transformer.plot_distance_ranking()
         verif_svd(rb_data,pyramid_json_path)
 
         visualize_pyramid_frame_and_points(transformer, interactive=True, save_path=None)
@@ -334,8 +328,6 @@ def display_pyramid(
         cv2.putText(frame, f"Theta: {theta:.2f} deg / {np.deg2rad(theta):.2f} rad",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-        cv2.putText(frame, f"Workflow: {workflow_type}",
-                    (10, frame.shape[0] - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
         # Display initial theta source
         if use_notch and initial_theta is not None:
@@ -668,7 +660,6 @@ display_pyramid(
     calib_data=calib_data,
     pyramid_json_path=pyramid_json_path,
     use_notch=True,  # Enable notch detection
-    workflow_type="visualization",
     R_const_to_opt=None
 )
 
@@ -679,7 +670,6 @@ display_pyramid(
     calib_data=calib_data,
     pyramid_json_path=pyramid_json_path,
     use_notch=True,  # Enable notch detection
-    workflow_type="ranking",
     R_const_to_opt=None
 )
 """

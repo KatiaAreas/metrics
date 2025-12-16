@@ -38,7 +38,7 @@ def main():
         header_path=paths.headers_path,
         data_path=paths.data_path,
         video_timestamps_path=paths.timestamp_path,
-        unit_scale=1.0 #mm sinon 1.0
+        unit_scale=1.0 #m sinon 1000 pour mm
     )
     print(f"Rigid bodies data loaded successfully. Found {len(rb_data)} data points.")
 
@@ -72,7 +72,6 @@ def main():
             calib_data=calib_data,
             pyramid_json_path=pyramid_json_path,
             use_notch=(config.angle_detector_type == "notch"),
-            workflow_type="visualization", # or  ranking
             R_const_to_opt=rot_constellation_opti,
             vectors_log_path=vectors_log_path,  # Load initial theta from file
             verify_transformation=True
