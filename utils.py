@@ -14,6 +14,7 @@ from areas_theta_compute import NotchAngleComputer, get_default_weights_path
 from calibrate_pyramid_to_optitrack import complete_workflow_with_visualization
 from pyramid_transformer import PyramidTransformer, extract_marker_positions_from_rb_data, plot_svd_fit_quality
 from verification_script import verify_pyramid_transformation, visualize_pyramid_frame_and_points, verif_svd
+from metrics import Metrics
 
 
 def load_keypoints_from_json(json_path: Path) -> dict:
@@ -177,16 +178,26 @@ def display_pyramid(
         rb_data: dict[str, Any],
         calib_data,  # CalibData type
         pyramid_json_path: Path,
-        keypoints_json_path: Optional[Path] = None,  # NEW PARAMETER
+        keypoints_json_path: Optional[Path] = None,
         use_notch: bool = False,
         R_const_to_opt: npt.NDArray[np.float64] | None = None,
         vectors_log_path: Optional[Path] = None,
         verify_transformation: bool = True,
+        compute_metrics: bool = False,
+        metrics_output_path: Optional[Path] = None,
+        reference_frame: str = "optitrack",
+        error_unit: str = "m",
+        show_per_point_errors: bool = True,
+        show_frame_stats: bool = True,
+        show_cumulative_stats: bool = True,
+        enable_realtime_plot: bool = True,
+        show_plot_in_video: bool = True,
 ) -> None:
     """
-    Display pyramid points overlaid on video frames.
+    Display pyramid points overlaid on video frames with optional metrics calculation.
 
-    NEW: Can also display 2D keypoints from a separate JSON file alongside pyramid points.
+    NEW: Can compute and display error metrics between 2D keypoints and reprojected pyramid points.
+    NEW: Can show real-time cumulative error plots.
 
     Pipeline:
     1. Load pyramid geometry (points 0-17 from JSON)
@@ -198,6 +209,8 @@ def display_pyramid(
        d. Apply notch rotation correction (optional)
        e. Draw pyramid points on frame
        f. Draw 2D keypoints on frame (if provided)
+       g. Compute and display metrics (if enabled)
+       h. Update real-time plots (if enabled)
 
     Args:
         video_path: Path to the video file
@@ -209,6 +222,15 @@ def display_pyramid(
         R_const_to_opt: Rotation from constellation to OptiTrack frame
         vectors_log_path: Path to vectors.log file for initial theta
         verify_transformation: Whether to run verification plots
+        compute_metrics: Whether to compute error metrics (requires keypoints_json_path)
+        metrics_output_path: Path to save metrics JSON file (if None, only displays)
+        reference_frame: Reference frame for 3D error calculation ("optitrack" or "pyramid")
+        error_unit: Unit for 3D errors ("mm" or "m")
+        show_per_point_errors: Whether to show errors for individual points
+        show_frame_stats: Whether to show per-frame error statistics
+        show_cumulative_stats: Whether to show cumulative error statistics
+        enable_realtime_plot: Whether to show real-time cumulative error plots
+        show_plot_in_video: Whether to embed the plot in the video frame (requires enable_realtime_plot)
     """
     # =========================================================================
     # STEP 1: Load pyramid geometry and compute transformation
@@ -258,12 +280,8 @@ def display_pyramid(
     ####################### Test transforms##################################
     if verify_transformation:
         transformer.plot_constellation_frame()
-        # sorted_points, distances, point_indices, sorted_idx, sorted_distances=transformer.plot_distance_ranking_with_3d()
-        # transformer.plot_distance_ranking()
         verif_svd(rb_data, pyramid_json_path)
-
         visualize_pyramid_frame_and_points(transformer, interactive=True, save_path=None)
-
         verify_pyramid_transformation(
             rb_data=rb_data,
             calib_data=calib_data,
@@ -274,7 +292,7 @@ def display_pyramid(
     ########################################
 
     # =========================================================================
-    # STEP 1.5: Load 2D keypoints if provided (NEW)
+    # STEP 1.5: Load 2D keypoints if provided
     # =========================================================================
     keypoints_dict = None
     if keypoints_json_path is not None:
@@ -288,6 +306,48 @@ def display_pyramid(
         except Exception as e:
             print(f"Error loading keypoints: {e}")
             keypoints_dict = None
+
+    # # =========================================================================
+    # # Verify scale
+    # #==========================================================================
+    # from scale_diagnostics import diagnose_scale_issues
+    #
+    # diagnose_scale_issues(
+    #     calib_data=calib_data,
+    #     transformer=transformer,
+    #     rb_data=rb_data,
+    #     keypoints_dict=keypoints_dict,
+    #     frame_id=0
+    # )
+
+    # =========================================================================
+    # STEP 1.6: Initialize Metrics if needed
+    # =========================================================================
+    metrics = None
+    if compute_metrics and keypoints_dict is not None:
+        print("\n" + "=" * 70)
+        print(f"INITIALIZING METRICS COMPUTATION")
+        print("=" * 70)
+        metrics = Metrics(
+            calib_data=calib_data,
+            transformer=transformer,
+            error_unit=error_unit,
+            enable_realtime_plot=enable_realtime_plot  # NEW
+        )
+        print(f"✓ Metrics initialized")
+        print(f"  - Reference frame: {reference_frame}")
+        print(f"  - 3D error unit: {error_unit}")
+        if enable_realtime_plot:
+            print(f"  - Real-time plotting: ENABLED")
+            if show_plot_in_video:
+                print(f"  - Plot embedded in video: YES")
+            else:
+                print(f"  - Plot in separate window: YES")
+        if metrics_output_path:
+            print(f"  - Will save to: {metrics_output_path}")
+    elif compute_metrics and keypoints_dict is None:
+        print("\n⚠ WARNING: compute_metrics=True but no keypoints provided.")
+        print("           Metrics computation disabled.")
 
     # =========================================================================
     # STEP 2: Initialize notch detector if needed
@@ -347,6 +407,9 @@ def display_pyramid(
     if keypoints_dict is not None:
         print("2D Keypoints: ENABLED (will be drawn in BLUE)")
 
+    if metrics is not None:
+        print("Metrics computation: ENABLED")
+
     # Define the starting frame ID
     start_frame_id: int = 0
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame_id)
@@ -401,14 +464,16 @@ def display_pyramid(
         R_cor = rotation_correction_cw(theta, camera_center_x, camera_center_y)
 
         # =====================================================================
-        # Draw pyramid points (only if notch is visible when using notch mode)
+        # Draw pyramid points and get reprojected coordinates
         # =====================================================================
+        reprojected_points_2d = None
         should_draw = True
         if use_notch and not notch_visible:
             should_draw = False
 
         if should_draw:
-            draw_pyramid_points(
+            # Modified function that returns coordinates
+            reprojected_points_2d = draw_pyramid_points_and_get_coords(
                 frame,
                 frame_id,
                 rb_data,
@@ -418,7 +483,7 @@ def display_pyramid(
             )
 
         # =====================================================================
-        # Draw 2D keypoints (NEW)
+        # Draw 2D keypoints
         # =====================================================================
         if keypoints_dict is not None and frame_id in keypoints_dict:
             keypoints = keypoints_dict[frame_id]
@@ -432,7 +497,54 @@ def display_pyramid(
 
             # Display keypoint info
             cv2.putText(frame, f"2D Keypoints: {visible_kp_count}/{len(keypoints)} visible",
-                        (10, frame.shape[0] - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                        (10, frame.shape[0] - (160 if metrics is not None else 50)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+
+            # =================================================================
+            # Compute and display metrics
+            # =================================================================
+            if metrics is not None and reprojected_points_2d is not None:
+                try:
+                    # Compute errors for this frame
+                    frame_errors = metrics.update_frame_errors(
+                        keypoints=keypoints,
+                        reprojected_points_2d=reprojected_points_2d,
+                        points_pyramid_frame=points_pyramid,
+                        frame_id=frame_id,
+                        rb_data=rb_data,
+                        reference_frame=reference_frame
+                    )
+
+                    # Draw errors on frame
+                    metrics.draw_errors_on_frame(
+                        frame=frame,
+                        frame_errors=frame_errors,
+                        keypoints=keypoints,
+                        reprojected_points_2d=reprojected_points_2d,
+                        show_per_point=show_per_point_errors,
+                        show_frame_stats=show_frame_stats,
+                        show_cumulative_stats=show_cumulative_stats
+                    )
+
+                    # Update real-time plot (NEW)
+                    if enable_realtime_plot:
+                        metrics.update_realtime_plot()
+
+                        # Optionally embed plot in video frame
+                        if show_plot_in_video:
+                            plot_img = metrics.get_plot_as_image(
+                                width=frame.shape[1] // 2,
+                                height=frame.shape[0] // 2
+                            )
+                            if plot_img is not None:
+                                # Overlay plot on top-right corner of frame
+                                h, w = plot_img.shape[:2]
+                                frame[0:h, frame.shape[1] - w:frame.shape[1]] = plot_img
+
+                except Exception as e:
+                    print(f"Error computing metrics for frame {frame_id}: {e}")
+                    cv2.putText(frame, f"Metrics error: {str(e)[:30]}",
+                                (10, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
         # Display theta information
         cv2.putText(frame, f"Theta: {theta:.2f} deg / {np.deg2rad(theta):.2f} rad",
@@ -442,10 +554,11 @@ def display_pyramid(
         if use_notch and initial_theta is not None:
             theta_source = "vectors.log" if vectors_log_path is not None else "first detection"
             cv2.putText(frame, f"Init theta: {initial_theta:.2f}deg ({theta_source})",
-                        (10, frame.shape[0] - 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                        (10, frame.shape[0] - (130 if metrics is not None else 80)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
         # Display the frame
-        cv2.imshow("Pyramid Points Overlay", frame)
+        cv2.imshow("Pyramid Points Overlay with Metrics", frame)
 
         # Wait for key press (16ms ≈ 60fps)
         if cv2.waitKey(16) & 0xFF == ord('q'):
@@ -457,6 +570,136 @@ def display_pyramid(
     # Clean up
     cap.release()
     cv2.destroyAllWindows()
+
+    # =========================================================================
+    # Save and print metrics summary
+    # =========================================================================
+    if metrics is not None:
+        print("\n" + "=" * 70)
+        print("FINALIZING METRICS")
+        print("=" * 70)
+
+        # Print summary to console
+        metrics.print_summary()
+
+        # Save to file if path provided
+        if metrics_output_path is not None:
+            metrics.save_statistics(metrics_output_path)
+
+        # Close plot window
+        if enable_realtime_plot:
+            print("\nClose the plot window to continue...")
+            metrics.close_plot()
+
+
+def draw_pyramid_points_and_get_coords(
+        frame: np.ndarray,
+        frame_id: int,
+        rb_data: dict[str, Any],
+        calib_data,  # CalibData type
+        points_optitrack_m: np.ndarray,
+        R_cor: np.ndarray
+) -> Optional[np.ndarray]:
+    """
+    Draw pyramid points on the video frame AND return the 2D coordinates.
+
+    This is a modified version of draw_pyramid_points that also returns
+    the corrected 2D coordinates for metrics calculation.
+
+    Args:
+        frame: Video frame to draw on
+        frame_id: Current frame index
+        rb_data: Dictionary containing rigid body tracking data
+        calib_data: Camera calibration data
+        points_optitrack_m: Point positions in OptiTrack rigid body frame (Nx3, meters)
+        R_cor: 3x3 rotation correction matrix for 2D homogeneous coordinates
+
+    Returns:
+        Nx2 array of corrected 2D coordinates, or None if rigid bodies not visible
+    """
+    # Check if all required rigid bodies are visible
+    is_lens_visible = rb_data["Lens_RB"][frame_id].data.is_visible
+    is_cam_visible = rb_data["Cam_RB"][frame_id].data.is_visible
+    is_pyramid_visible = rb_data["Pyramid_RB"][frame_id].data.is_visible
+
+    if not (is_cam_visible and is_lens_visible and is_pyramid_visible):
+        # Draw visibility warnings
+        if not is_pyramid_visible:
+            cv2.putText(frame, "Pyramid not visible in OptiTrack",
+                        (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        if not is_lens_visible:
+            cv2.putText(frame, "Lens not visible in OptiTrack",
+                        (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        if not is_cam_visible:
+            cv2.putText(frame, "Camera not visible in OptiTrack",
+                        (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        return None
+
+    try:
+        # Get transformation matrices
+        T_World_Lens = rb_data["Lens_RB"][frame_id].get_transform()
+        T_World_Pyramid = rb_data["Pyramid_RB"][frame_id].get_transform()
+        RT = np.linalg.inv(T_World_Lens @ calib_data.RT)
+
+        # Transform points to world frame
+        n_points = points_optitrack_m.shape[0]
+        points_hom = np.hstack([points_optitrack_m, np.ones((n_points, 1))])  # Nx4
+        points_world_hom = (T_World_Pyramid @ points_hom.T).T  # Nx4
+        obj_pts = points_world_hom[:, 0:3]  # Nx3
+
+        # Project to image coordinates
+        proj_marker_2d = cv2.projectPoints(
+            obj_pts,
+            cv2.Rodrigues(RT[:3, :3])[0],
+            RT[:3, 3],
+            calib_data.K,
+            calib_data.dist_coeffs
+        )[0]
+
+        # Apply rotation correction
+        homog_marker_2d = np.hstack([proj_marker_2d.reshape(-1, 2), np.ones((proj_marker_2d.shape[0], 1))]).T
+        homog_marker_2d_cor = R_cor @ homog_marker_2d
+
+        # Extract 2D coordinates
+        corrected_2d = homog_marker_2d_cor[:2, :].T  # Nx2
+
+        # Draw points on frame
+        if homog_marker_2d_cor is not None:
+            try:
+                points_in_frame = 0
+                for i in range(homog_marker_2d_cor.shape[1]):
+                    x, y = homog_marker_2d_cor[:2, i].flatten()
+                    x_int, y_int = int(round(x)), int(round(y))
+
+                    # Check if point is within frame bounds
+                    if 0 <= x_int < frame.shape[1] and 0 <= y_int < frame.shape[0]:
+                        points_in_frame += 1
+
+                        # Draw the point (green circle)
+                        cv2.circle(frame, (x_int, y_int), 5, (0, 255, 0), -1)
+
+                        # Draw the point index number
+                        cv2.putText(frame, str(i), (x_int + 8, y_int - 8),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+
+                # Draw info text
+                cv2.putText(frame, f"Pyramid points: {points_in_frame}/{n_points} visible",
+                            (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+            except Exception as e:
+                print(f"Error drawing pyramid points at frame {frame_id}: {e}")
+                cv2.putText(frame, f"Draw error: {str(e)[:30]}",
+                            (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+        return corrected_2d
+
+    except Exception as e:
+        print(f"Error in draw_pyramid_points_and_get_coords at frame {frame_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        cv2.putText(frame, f"Error: {str(e)[:50]}",
+                    (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        return None
 
 
 def draw_pyramid_points(
@@ -747,35 +990,3 @@ def draw_marker(
                                -1)
             except Exception as e:
                 print(f"Error drawing marker: {e}")
-
-
-# ==============================================================================
-# USAGE EXAMPLES:
-# ==============================================================================
-"""
-from pathlib import Path
-from utils import display_pyramid
-
-# Example with 2D keypoints visualization
-video_path = Path("your_video.mp4")
-rb_data = your_rb_data
-calib_data = your_calib_data
-pyramid_json_path = Path("ModelMire3DSLAM.json")
-keypoints_json_path = Path("pyramid_0_keypoints.json")  # NEW
-
-# Display pyramid with 2D keypoints overlay
-display_pyramid(
-    video_path=video_path,
-    rb_data=rb_data,
-    calib_data=calib_data,
-    pyramid_json_path=pyramid_json_path,
-    keypoints_json_path=keypoints_json_path,  # NEW: Add keypoints
-    use_notch=True,
-    R_const_to_opt=None
-)
-
-# The visualization will show:
-# - GREEN circles: Projected 3D pyramid points
-# - BLUE circles: 2D detected keypoints from JSON
-# Both with their respective IDs and visibility counts
-"""

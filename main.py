@@ -61,10 +61,12 @@ def main():
         pyramid_json_path = Path(config.base_data_dir) / "ModelMire3DSLAM3.json"
         vectors_log_path = Path(config.base_data_dir) / "camera_models/vectors.log"
         keypoints_json_path = Path(config.base_data_dir) / "pyramid_ppoints/pyramid_points_coordinates.json"
+        metric_output = Path(config.base_data_dir) / "output_result_metrics.json"
 
         frame=0
         fig, ax,distance, rot_constellation_opti, rot_data = visualize_rigid_body(rb_data, frame_id=frame)
         plt.show()
+
 
 
         display_pyramid(
@@ -76,7 +78,12 @@ def main():
             use_notch=(config.angle_detector_type == "notch"),
             R_const_to_opt=rot_constellation_opti,
             vectors_log_path=vectors_log_path,  # Load initial theta from file
-            verify_transformation=True
+            verify_transformation=True,
+            compute_metrics=True,
+            enable_realtime_plot=True,
+            metrics_output_path=metric_output,
+            error_unit="mm",
+            reference_frame="optitrack"
         )
     else:
         # Display calibration or pen markers
