@@ -38,6 +38,57 @@ def load_keypoints_from_json(json_path: Path) -> dict:
 
     return keypoints_dict
 
+def rotation_correction_ellipse_ccw(theta_degrees, ox, oy, rx, ry):
+    """
+    Generates a 3x3 homogeneous transformation matrix for a 2D counter-clockwise
+    rotation around a specified center point.
+
+    Args:
+        theta_degrees (float): The counter-clockwise rotation angle in degrees.
+        ox (float): The x-coordinate of the center of rotation (origin).
+        oy (float): The y-coordinate of the center of rotation (origin).
+
+    Returns:
+        np.ndarray: A 3x3 NumPy array representing the transformation matrix.
+    """
+    theta_rad = np.deg2rad(theta_degrees)
+    cos_theta = np.cos(theta_rad)
+    sin_theta = np.sin(theta_rad)
+
+    rotation_matrix = np.array([
+        [rx * cos_theta, -ry * sin_theta, (1 - cos_theta) * ox + sin_theta * oy],
+        [rx * sin_theta, ry * cos_theta, -sin_theta * ox + (1 - cos_theta) * oy],
+        [0, 0, 1]
+    ])
+
+    return rotation_matrix
+
+
+def rotation_correction_ellipse_cw(theta_degrees, ox, oy, rx, ry):
+    """
+    Generates a 3x3 homogeneous transformation matrix for a 2D clockwise
+    rotation around a specified center point.
+
+    Args:
+        theta_degrees (float): The clockwise rotation angle in degrees.
+        ox (float): The x-coordinate of the center of rotation (origin).
+        oy (float): The y-coordinate of the center of rotation (origin).
+
+    Returns:
+        np.ndarray: A 3x3 NumPy array representing the transformation matrix.
+    """
+    theta_rad = np.deg2rad(theta_degrees)
+    cos_theta = np.cos(theta_rad)
+    sin_theta = np.sin(theta_rad)
+
+    rotation_matrix = np.array([
+        [rx * cos_theta, ry * sin_theta, (1 - cos_theta) * ox - sin_theta * oy],
+        [-rx * sin_theta, ry * cos_theta, sin_theta * ox + (1 - cos_theta) * oy],
+        [0, 0, 1]
+    ])
+
+    return rotation_matrix
+
 
 def rotation_correction_ccw(theta_degrees, ox, oy):
     """
@@ -619,10 +670,10 @@ def draw_pyramid_points_and_get_coords(
     """
     # Check if all required rigid bodies are visible
     is_lens_visible = rb_data["Lens_RB"][frame_id].data.is_visible
-    is_cam_visible = rb_data["Cam_RB"][frame_id].data.is_visible
+    # is_cam_visible = rb_data["Cam_RB"][frame_id].data.is_visible
     is_pyramid_visible = rb_data["Pyramid_RB"][frame_id].data.is_visible
 
-    if not (is_cam_visible and is_lens_visible and is_pyramid_visible):
+    if not (is_lens_visible and is_pyramid_visible):
         # Draw visibility warnings
         if not is_pyramid_visible:
             cv2.putText(frame, "Pyramid not visible in OptiTrack",
@@ -630,9 +681,9 @@ def draw_pyramid_points_and_get_coords(
         if not is_lens_visible:
             cv2.putText(frame, "Lens not visible in OptiTrack",
                         (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        if not is_cam_visible:
-            cv2.putText(frame, "Camera not visible in OptiTrack",
-                        (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        # if not is_cam_visible:
+        #     cv2.putText(frame, "Camera not visible in OptiTrack",
+        #                 (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         return None
 
     try:
@@ -732,10 +783,10 @@ def draw_pyramid_points(
     """
     # Check if all required rigid bodies are visible
     is_lens_visible = rb_data["Lens_RB"][frame_id].data.is_visible
-    is_cam_visible = rb_data["Cam_RB"][frame_id].data.is_visible
+    # is_cam_visible = rb_data["Cam_RB"][frame_id].data.is_visible
     is_pyramid_visible = rb_data["Pyramid_RB"][frame_id].data.is_visible
 
-    if not (is_cam_visible and is_lens_visible and is_pyramid_visible):
+    if not (is_lens_visible and is_pyramid_visible):
         # Draw visibility warnings
         if not is_pyramid_visible:
             cv2.putText(frame, "Pyramid not visible in OptiTrack",
@@ -743,9 +794,9 @@ def draw_pyramid_points(
         if not is_lens_visible:
             cv2.putText(frame, "Lens not visible in OptiTrack",
                         (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        if not is_cam_visible:
-            cv2.putText(frame, "Camera not visible in OptiTrack",
-                        (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        # if not is_cam_visible:
+        #     cv2.putText(frame, "Camera not visible in OptiTrack",
+        #                 (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         return
 
     try:
@@ -979,11 +1030,11 @@ def draw_marker(
 
     if homog_marker_2d_cor is not None:
         is_lens_visible = rb_data["Lens_RB"][frame_id].data.is_visible
-        is_cam_visible = rb_data["Cam_RB"][frame_id].data.is_visible
+        # is_cam_visible = rb_data["Cam_RB"][frame_id].data.is_visible
         is_rb_visible = rb_data["Pen_RB"][frame_id].data.is_visible if pen_mode else rb_data["Calib_RB"][
             frame_id].data.is_visible
 
-        if is_cam_visible and is_lens_visible and is_rb_visible:
+        if is_lens_visible and is_rb_visible:
             try:
                 for i in range(homog_marker_2d_cor.shape[1]):
                     cv2.circle(frame, tuple(np.round(homog_marker_2d_cor[:2, i].flatten()).astype(int)), 5, (0, 0, 255),

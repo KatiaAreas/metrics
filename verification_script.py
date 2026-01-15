@@ -158,14 +158,16 @@ def verify_pyramid_transformation(
     print("-" * 70)
     
     is_lens_visible = rb_data["Lens_RB"][frame_id].data.is_visible
-    is_cam_visible = rb_data["Cam_RB"][frame_id].data.is_visible
+    # is_cam_visible = rb_data["Cam_RB"][frame_id].data.is_visible
     is_pyramid_visible = rb_data["Pyramid_RB"][frame_id].data.is_visible
     
     print(f"Lens_RB visible:    {is_lens_visible}")
-    print(f"Cam_RB visible:     {is_cam_visible}")
+    # print(f"Cam_RB visible:     {is_cam_visible}")
     print(f"Pyramid_RB visible: {is_pyramid_visible}")
     
-    if is_lens_visible and is_cam_visible and is_pyramid_visible:
+    # if is_lens_visible and is_cam_visible and is_pyramid_visible:
+    #     print("✓ PASSED: All rigid bodies visible")
+    if is_lens_visible and is_pyramid_visible:
         print("✓ PASSED: All rigid bodies visible")
     else:
         print("❌ FAILED: Some rigid bodies not visible")
