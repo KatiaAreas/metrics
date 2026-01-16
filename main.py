@@ -96,11 +96,13 @@ def main():
             R_const_to_opt=rot_constellation_opti,
             vectors_log_path=vectors_log_path,  # Load initial theta from file
             verify_transformation=True,
+            enable_uncertainty_analysis=True,
             # compute_metrics=True,
             # enable_realtime_plot=True,
             # metrics_output_path=metric_output,
             # error_unit="mm",
             # reference_frame="optitrack"
+
         )
     else:
         # Display calibration or pen markers
