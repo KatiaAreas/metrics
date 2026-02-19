@@ -1,671 +1,671 @@
 """
-Uncertainty and Accuracy Analysis Pipeline for Frame Transformations
+uncertainty_analysis.py
+=======================
+Three-stage uncertainty analysis for the OptiTrack → Camera reprojection pipeline.
 
-This module analyzes error propagation through the transformation chain:
-1. 3D Model → OptiTrack frame (SVD fitting error)
-2. OptiTrack → Camera frame (extrinsics uncertainty)
-3. Camera projection (intrinsics uncertainty)
-4. Overall reprojection error
+Stage 1 – Model → OptiTrack   : SVD rigid-body fitting residuals (mm)
+Stage 2 – OptiTrack → Camera  : Rigid-body tracking jitter (mm, °)
+Stage 3 – Camera projection   : Reprojection error vs 2D keypoints (px)
 
-Each stage quantifies:
-- Geometric errors (translations, rotations)
-- Statistical measures (mean, std, max errors)
-- Error propagation to final 2D projection
+UncertaintyPlotter
+------------------
+Displays a 4-panel diagnostic figure in its **own cv2 window** ("Uncertainty Analysis").
+Call  plotter.update(record)  every N frames — the window refreshes automatically.
+No overlay on the video frame.
 """
 
-import numpy as np
-import numpy.typing as npt
-from typing import Dict, List, Tuple, Optional, Any
+from __future__ import annotations
+
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
-import json
-import matplotlib.pyplot as plt
-from matplotlib.figure import Figure
+from typing import Any, Dict, List, Optional, Tuple
+
 import cv2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+import numpy as np
+import numpy.typing as npt
 
-from pyramid_transformer import PyramidTransformer
-from calib_data import CalibData
 
+# ---------------------------------------------------------------------------
+# Quality thresholds (px)
+# ---------------------------------------------------------------------------
+THRESH_GOOD   = 2.0   # green dashed line
+THRESH_ACCEPT = 5.0   # orange dashed line
+
+
+# =============================================================================
+# Data-classes
+# =============================================================================
 
 @dataclass
 class TransformationUncertainty:
-    """Stores uncertainty metrics for a single transformation stage."""
+    """Uncertainty metrics for one pipeline stage."""
     stage_name: str
-    
-    # Geometric errors
+    # 3D fit quality
+    mean_error_3d_m:   Optional[float] = None
+    std_error_3d_m:    Optional[float] = None
+    max_error_3d_m:    Optional[float] = None
+    point_errors_3d_m: Optional[npt.NDArray[np.float64]] = None
+    condition_number:  Optional[float] = None
+    residual_norm:     Optional[float] = None
+    # Tracking
     translation_error_m: Optional[float] = None
-    rotation_error_deg: Optional[float] = None
-    
-    # Point-wise errors
-    point_errors_3d_m: Optional[npt.NDArray[np.float64]] = None  # N points
-    mean_error_3d_m: Optional[float] = None
-    std_error_3d_m: Optional[float] = None
-    max_error_3d_m: Optional[float] = None
-    
-    # 2D projection errors (if applicable)
-    reprojection_errors_px: Optional[npt.NDArray[np.float64]] = None  # N points
+    rotation_error_deg:  Optional[float] = None
+    # Reprojection
     mean_reprojection_error_px: Optional[float] = None
-    std_reprojection_error_px: Optional[float] = None
-    max_reprojection_error_px: Optional[float] = None
-    
-    # Additional metrics
-    condition_number: Optional[float] = None
-    residual_norm: Optional[float] = None
-    
-    # Metadata
+    std_reprojection_error_px:  Optional[float] = None
+    max_reprojection_error_px:  Optional[float] = None
+    reprojection_errors_px: Optional[npt.NDArray[np.float64]] = None
     num_points: int = 0
     notes: str = ""
 
 
 @dataclass
 class UncertaintyReport:
-    """Complete uncertainty analysis report for the transformation pipeline."""
-    
-    # Stage-wise uncertainties
-    model_to_optitrack: Optional[TransformationUncertainty] = None
+    """Complete pipeline report for one frame."""
+    model_to_optitrack:  Optional[TransformationUncertainty] = None
     optitrack_to_camera: Optional[TransformationUncertainty] = None
-    camera_projection: Optional[TransformationUncertainty] = None
-    
-    # End-to-end metrics
+    camera_projection:   Optional[TransformationUncertainty] = None
     total_reprojection_error_px: Optional[float] = None
-    error_propagation_analysis: Dict[str, Any] = field(default_factory=dict)
-    
-    # Per-frame analysis (if applicable)
-    frame_uncertainties: Dict[int, Dict[str, TransformationUncertainty]] = field(default_factory=dict)
-    
-    def to_dict(self) -> Dict:
-        """Convert report to dictionary for JSON serialization."""
-        result = {}
-        
-        for stage_name, stage_data in [
-            ("model_to_optitrack", self.model_to_optitrack),
-            ("optitrack_to_camera", self.optitrack_to_camera),
-            ("camera_projection", self.camera_projection)
-        ]:
-            if stage_data is not None:
-                result[stage_name] = {
-                    "translation_error_m": stage_data.translation_error_m,
-                    "rotation_error_deg": stage_data.rotation_error_deg,
-                    "mean_error_3d_m": stage_data.mean_error_3d_m,
-                    "std_error_3d_m": stage_data.std_error_3d_m,
-                    "max_error_3d_m": stage_data.max_error_3d_m,
-                    "mean_reprojection_error_px": stage_data.mean_reprojection_error_px,
-                    "std_reprojection_error_px": stage_data.std_reprojection_error_px,
-                    "max_reprojection_error_px": stage_data.max_reprojection_error_px,
-                    "condition_number": stage_data.condition_number,
-                    "residual_norm": stage_data.residual_norm,
-                    "num_points": stage_data.num_points,
-                    "notes": stage_data.notes
-                }
-        
-        result["total_reprojection_error_px"] = self.total_reprojection_error_px
-        result["error_propagation_analysis"] = self.error_propagation_analysis
-        
-        return result
-    
-    def save_json(self, filepath: Path) -> None:
-        """Save report to JSON file."""
-        with open(filepath, 'w') as f:
-            json.dump(self.to_dict(), f, indent=2)
-        print(f"✓ Uncertainty report saved to: {filepath}")
+    # Cache for downstream use
+    points_3d_camera_last: Optional[npt.NDArray[np.float64]] = None
 
+    def to_dict(self) -> Dict:
+        out: Dict = {}
+        for name in ("model_to_optitrack", "optitrack_to_camera", "camera_projection"):
+            u: Optional[TransformationUncertainty] = getattr(self, name)
+            if u is None:
+                continue
+            out[name] = {
+                "mean_error_3d_mm":           (u.mean_error_3d_m  or 0) * 1000,
+                "std_error_3d_mm":            (u.std_error_3d_m   or 0) * 1000,
+                "max_error_3d_mm":            (u.max_error_3d_m   or 0) * 1000,
+                "translation_error_mm":       (u.translation_error_m or 0) * 1000,
+                "rotation_error_deg":          u.rotation_error_deg,
+                "mean_reprojection_error_px":  u.mean_reprojection_error_px,
+                "std_reprojection_error_px":   u.std_reprojection_error_px,
+                "max_reprojection_error_px":   u.max_reprojection_error_px,
+                "condition_number":            u.condition_number,
+                "num_points":                  u.num_points,
+                "notes":                       u.notes,
+            }
+        out["total_reprojection_error_px"] = self.total_reprojection_error_px
+        return out
+
+    def save_json(self, path: Path) -> None:
+        with open(path, "w") as f:
+            json.dump(self.to_dict(), f, indent=2)
+        print(f"[OK] Report saved → {path}")
+
+
+# =============================================================================
+# UncertaintyAnalyzer
+# =============================================================================
 
 class UncertaintyAnalyzer:
     """
-    Analyzes uncertainty at each stage of the transformation pipeline.
+    Analyzes uncertainty at each stage of the projection pipeline.
+
+    Parameters
+    ----------
+    transformer : PyramidTransformer
+    calib_data  : CalibData
+    verbose     : bool
     """
-    
-    def __init__(
-        self,
-        transformer: PyramidTransformer,
-        calib_data: CalibData,
-        verbose: bool = True
-    ):
-        """
-        Initialize the uncertainty analyzer.
-        
-        Args:
-            transformer: PyramidTransformer with computed transformations
-            calib_data: Camera calibration data
-            verbose: Whether to print detailed information
-        """
+
+    def __init__(self, transformer, calib_data, verbose: bool = True):
         self.transformer = transformer
-        self.calib_data = calib_data
-        self.verbose = verbose
-        
-        self.report = UncertaintyReport()
-    
+        self.calib_data  = calib_data
+        self.verbose     = verbose
+        self.report      = UncertaintyReport()
+
+    # ------------------------------------------------------------------
+    # Stage 1 – SVD fitting: model → OptiTrack
+    # ------------------------------------------------------------------
     def analyze_model_to_optitrack(
         self,
-        marker_positions_m: Dict[str, npt.NDArray[np.float64]],
-        matching: Dict[str, int]
+        marker_positions_m: Dict[str, npt.NDArray],
+        matching: Dict[str, int],
     ) -> TransformationUncertainty:
-        """
-        Analyze uncertainty in the 3D model → OptiTrack transformation.
-        
-        This stage uses SVD to fit the pyramid's marker constellation to OptiTrack markers.
-        
-        Args:
-            marker_positions_m: OptiTrack marker positions {marker_name: [x, y, z]}
-            matching: Dictionary mapping marker names to pyramid point IDs
-            
-        Returns:
-            TransformationUncertainty object with SVD fitting errors
-        """
-        if self.verbose:
-            print("\n" + "="*70)
-            print("STAGE 1: 3D Model → OptiTrack Frame")
-            print("="*70)
-        
-        uncertainty = TransformationUncertainty(
+        u = TransformationUncertainty(
             stage_name="model_to_optitrack",
-            num_points=len(matching)
+            num_points=len(matching),
         )
-        
-        # Get the constellation points in pyramid frame
-        constellation_ids = list(matching.values())
-        constellation_points_pyramid = self.transformer.points_m[constellation_ids]
-        
-        # Transform to pyramid frame (world → pyramid)
-        R_pyramid = self.transformer.R_pyramid
-        pyramid_origin = self.transformer.pyramid_origin_m
-        constellation_pyramid_frame = (R_pyramid.T @ (constellation_points_pyramid - pyramid_origin).T).T
-        
-        # Get corresponding OptiTrack positions
-        optitrack_positions = np.array([marker_positions_m[name] for name in matching.keys()])
-        
-        # Compute the fitted OptiTrack positions using the computed transformation
-        constellation_optitrack_fitted = self.transformer.transform_pyramid_to_optitrack(
-            constellation_pyramid_frame
-        )
-        
-        # Calculate 3D errors
-        point_errors_3d = np.linalg.norm(optitrack_positions - constellation_optitrack_fitted, axis=1)
-        
-        uncertainty.point_errors_3d_m = point_errors_3d
-        uncertainty.mean_error_3d_m = float(np.mean(point_errors_3d))
-        uncertainty.std_error_3d_m = float(np.std(point_errors_3d))
-        uncertainty.max_error_3d_m = float(np.max(point_errors_3d))
-        
-        # Compute SVD condition number (indicates numerical stability)
-        # Center the points
-        centered_pyramid = constellation_pyramid_frame - np.mean(constellation_pyramid_frame, axis=0)
-        centered_optitrack = optitrack_positions - np.mean(optitrack_positions, axis=0)
-        
-        # SVD of covariance matrix
-        H = centered_pyramid.T @ centered_optitrack
-        U, S, Vt = np.linalg.svd(H)
-        
-        uncertainty.condition_number = float(S[0] / S[-1]) if S[-1] > 1e-10 else float('inf')
-        uncertainty.residual_norm = float(np.linalg.norm(optitrack_positions - constellation_optitrack_fitted))
-        
-        uncertainty.notes = f"SVD-based rigid transformation. {len(matching)} markers used for fitting."
-        
+
+        cids   = list(matching.values())
+        pts_w  = self.transformer.points_m[cids]
+        R_pyr  = self.transformer.R_pyramid
+        origin = self.transformer.pyramid_origin_m
+        pts_p  = (R_pyr.T @ (pts_w - origin).T).T
+        opti   = np.array([marker_positions_m[n] for n in matching.keys()])
+        fitted = self.transformer.transform_pyramid_to_optitrack(pts_p)
+
+        errs = np.linalg.norm(opti - fitted, axis=1)
+        u.point_errors_3d_m = errs
+        u.mean_error_3d_m   = float(np.mean(errs))
+        u.std_error_3d_m    = float(np.std(errs))
+        u.max_error_3d_m    = float(np.max(errs))
+        u.residual_norm      = float(np.linalg.norm(opti - fitted))
+
+        c0 = pts_p - pts_p.mean(0)
+        c1 = opti  - opti.mean(0)
+        _, S, _ = np.linalg.svd(c0.T @ c1)
+        u.condition_number = float(S[0] / S[-1]) if S[-1] > 1e-10 else float("inf")
+        u.notes = f"SVD fit over {len(matching)} markers."
+
         if self.verbose:
-            print(f"  SVD Fitting Quality:")
-            print(f"    Mean 3D error:      {uncertainty.mean_error_3d_m*1000:.3f} mm")
-            print(f"    Std 3D error:       {uncertainty.std_error_3d_m*1000:.3f} mm")
-            print(f"    Max 3D error:       {uncertainty.max_error_3d_m*1000:.3f} mm")
-            print(f"    Condition number:   {uncertainty.condition_number:.2f}")
-            print(f"    Residual norm:      {uncertainty.residual_norm*1000:.3f} mm")
-        
-        self.report.model_to_optitrack = uncertainty
-        return uncertainty
-    
+            print(f"  [Stage 1] SVD mean={u.mean_error_3d_m*1e3:.3f}mm "
+                  f"max={u.max_error_3d_m*1e3:.3f}mm  cond={u.condition_number:.1f}")
+
+        self.report.model_to_optitrack = u
+        return u
+
+    # ------------------------------------------------------------------
+    # Stage 2 – Tracking jitter: OptiTrack → camera
+    # ------------------------------------------------------------------
     def analyze_optitrack_to_camera(
         self,
-        rb_data: Dict[str, Any],
+        rb_data: Dict,
         frame_id: int,
-        test_points_pyramid: npt.NDArray[np.float64]
+        jitter_window: int = 5,
     ) -> TransformationUncertainty:
-        """
-        Analyze uncertainty in OptiTrack → Camera frame transformation (extrinsics).
-        
-        This includes:
-        - OptiTrack tracking noise
-        - Extrinsic calibration accuracy (RT matrix)
-        
-        Args:
-            rb_data: Rigid body tracking data
-            frame_id: Frame to analyze
-            test_points_pyramid: Points in pyramid frame to transform (Nx3)
-            
-        Returns:
-            TransformationUncertainty object with extrinsics errors
-        """
+        u = TransformationUncertainty(stage_name="optitrack_to_camera")
+
+        u.translation_error_m = self._jitter_translation(rb_data, frame_id, jitter_window)
+        u.rotation_error_deg  = self._jitter_rotation(rb_data, frame_id, jitter_window)
+
+        T_Lens = rb_data["Lens_RB"][frame_id].get_transform()
+        RT = np.linalg.inv(T_Lens @ self.calib_data.RT)
+        u.condition_number = float(np.linalg.cond(RT))
+
         if self.verbose:
-            print("\n" + "="*70)
-            print("STAGE 2: OptiTrack → Camera Frame (Extrinsics)")
-            print("="*70)
-        
-        uncertainty = TransformationUncertainty(
-            stage_name="optitrack_to_camera",
-            num_points=len(test_points_pyramid)
-        )
-        
-        # Get transformations
-        T_World_Lens = rb_data["Lens_RB"][frame_id].get_transform()
-        T_World_Pyramid = rb_data["Pyramid_RB"][frame_id].get_transform()
-        
-        # Transform points: pyramid → optitrack → world → camera
-        points_optitrack = self.transformer.transform_pyramid_to_optitrack(test_points_pyramid)
-        
-        # To world frame
-        n_points = points_optitrack.shape[0]
-        points_hom = np.hstack([points_optitrack, np.ones((n_points, 1))])
-        points_world = (T_World_Pyramid @ points_hom.T).T[:, :3]
-        
-        # To camera frame
-        RT = np.linalg.inv(T_World_Lens @ self.calib_data.RT)
-        points_camera = (RT[:3, :3] @ points_world.T + RT[:3, 3:4]).T
-        
-        # Analyze OptiTrack tracking uncertainty
-        # Get marker positions and their typical noise
-        pyramid_markers = rb_data["Pyramid_RB"][frame_id].data.marker_positions
-        if pyramid_markers:
-            marker_array = np.array(list(pyramid_markers.values()))
-            # Estimate tracking noise from marker spread (heuristic)
-            marker_centroid = np.mean(marker_array, axis=0)
-            marker_deviations = np.linalg.norm(marker_array - marker_centroid, axis=1)
-            tracking_noise_estimate = np.std(marker_deviations)
-        else:
-            tracking_noise_estimate = 0.001  # 1mm default estimate
-        
-        uncertainty.translation_error_m = tracking_noise_estimate
-        uncertainty.notes = f"OptiTrack tracking noise estimate: {tracking_noise_estimate*1000:.3f} mm. "
-        uncertainty.notes += f"Extrinsics from Lens_RB and RT matrix."
-        
-        # Estimate rotation uncertainty from quaternion noise (typical ~0.5 degrees)
-        uncertainty.rotation_error_deg = 0.5
-        
-        if self.verbose:
-            print(f"  Extrinsics Uncertainty:")
-            print(f"    OptiTrack tracking noise:  {tracking_noise_estimate*1000:.3f} mm")
-            print(f"    Estimated rotation noise:  {uncertainty.rotation_error_deg:.2f}°")
-            print(f"    RT matrix condition:       {np.linalg.cond(RT):.2f}")
-        
-        self.report.optitrack_to_camera = uncertainty
-        return uncertainty
-    
+            print(f"  [Stage 2] jitter trans={u.translation_error_m*1e3:.3f}mm "
+                  f"rot={u.rotation_error_deg:.4f}°")
+
+        self.report.optitrack_to_camera = u
+        return u
+
+    def _jitter_translation(self, rb_data, frame_id, win, key="Pyramid_RB"):
+        frames = rb_data[key]
+        n = len(frames)
+        pos = [
+            frames[f].get_transform()[:3, 3]
+            for f in range(max(0, frame_id - win), min(n, frame_id + win + 1))
+            if frames[f].data.is_visible
+        ]
+        if len(pos) < 3:
+            return 0.001
+        diffs = np.diff(np.array(pos), axis=0)
+        return float(np.linalg.norm(np.std(diffs, axis=0)))
+
+    def _jitter_rotation(self, rb_data, frame_id, win, key="Pyramid_RB"):
+        frames = rb_data[key]
+        n = len(frames)
+        rots = [
+            frames[f].get_transform()[:3, :3]
+            for f in range(max(0, frame_id - win), min(n, frame_id + win + 1))
+            if frames[f].data.is_visible
+        ]
+        if len(rots) < 3:
+            return 0.05
+        angles = [
+            float(np.degrees(np.arccos(
+                np.clip((np.trace(rots[i + 1] @ rots[i].T) - 1) / 2, -1, 1)
+            )))
+            for i in range(len(rots) - 1)
+        ]
+        return float(np.std(angles))
+
+    # ------------------------------------------------------------------
+    # Stage 3 – Camera projection / reprojection vs 2D keypoints
+    # ------------------------------------------------------------------
     def analyze_camera_projection(
         self,
-        points_3d_camera: npt.NDArray[np.float64],
-        points_2d_observed: Optional[npt.NDArray[np.float64]] = None,
-        R_cor: Optional[npt.NDArray[np.float64]] = None
+        pts_3d_camera: npt.NDArray,
+        pts_2d_observed: Optional[npt.NDArray] = None,
+        R_cor: Optional[npt.NDArray] = None,
     ) -> TransformationUncertainty:
-        """
-        Analyze uncertainty in camera projection (intrinsics).
-        
-        This includes:
-        - Focal length uncertainty
-        - Principal point uncertainty
-        - Distortion model errors
-        
-        Args:
-            points_3d_camera: Points in camera frame (Nx3)
-            points_2d_observed: Observed 2D points for comparison (Nx2), optional
-            R_cor: Rotation correction matrix (3x3), optional
-            
-        Returns:
-            TransformationUncertainty object with projection errors
-        """
-        if self.verbose:
-            print("\n" + "="*70)
-            print("STAGE 3: Camera Projection (Intrinsics)")
-            print("="*70)
-        
-        uncertainty = TransformationUncertainty(
+        u = TransformationUncertainty(
             stage_name="camera_projection",
-            num_points=len(points_3d_camera)
+            num_points=len(pts_3d_camera),
         )
-        
-        # Project points
-        rvec = np.zeros(3)  # Identity rotation (already in camera frame)
-        tvec = np.zeros(3)  # No translation
-        
-        points_2d_projected, _ = cv2.projectPoints(
-            points_3d_camera,
-            rvec,
-            tvec,
-            self.calib_data.K,
-            self.calib_data.dist_coeffs
+
+        p2d, _ = cv2.projectPoints(
+            pts_3d_camera, np.zeros(3), np.zeros(3),
+            self.calib_data.K, self.calib_data.dist_coeffs,
         )
-        points_2d_projected = points_2d_projected.reshape(-1, 2)
-        
-        # Apply rotation correction if provided
+        p2d = p2d.reshape(-1, 2)
+
         if R_cor is not None:
-            points_2d_hom = np.hstack([points_2d_projected, np.ones((len(points_2d_projected), 1))]).T
-            points_2d_corrected = (R_cor @ points_2d_hom)[:2, :].T
-            points_2d_projected = points_2d_corrected
-        
-        # Calculate reprojection errors if ground truth provided
-        if points_2d_observed is not None:
-            reprojection_errors = np.linalg.norm(points_2d_projected - points_2d_observed, axis=1)
-            
-            uncertainty.reprojection_errors_px = reprojection_errors
-            uncertainty.mean_reprojection_error_px = float(np.mean(reprojection_errors))
-            uncertainty.std_reprojection_error_px = float(np.std(reprojection_errors))
-            uncertainty.max_reprojection_error_px = float(np.max(reprojection_errors))
-        
-        # Analyze intrinsics uncertainty
-        # Condition number of K matrix
-        uncertainty.condition_number = float(np.linalg.cond(self.calib_data.K))
-        
-        # Estimate focal length uncertainty (typical 0.5-1% for good calibration)
-        fx = self.calib_data.K[0, 0]
-        fy = self.calib_data.K[1, 1]
-        focal_length_uncertainty_pct = 0.5  # Assume 0.5% uncertainty
-        
-        uncertainty.notes = f"Focal length: fx={fx:.1f}, fy={fy:.1f}. "
-        uncertainty.notes += f"Estimated focal length uncertainty: {focal_length_uncertainty_pct}%. "
-        uncertainty.notes += f"Distortion coeffs: {self.calib_data.dist_coeffs.ravel()}"
-        
-        if self.verbose:
-            print(f"  Intrinsics Uncertainty:")
-            print(f"    Focal length (fx, fy):     ({fx:.1f}, {fy:.1f}) px")
-            print(f"    Principal point (cx, cy):  {self.calib_data.camera_model.get_center()}")
-            print(f"    K matrix condition number: {uncertainty.condition_number:.2f}")
-            print(f"    Distortion coefficients:   {self.calib_data.dist_coeffs.ravel()}")
-            
-            if points_2d_observed is not None:
-                print(f"  Reprojection Errors:")
-                print(f"    Mean error:  {uncertainty.mean_reprojection_error_px:.2f} px")
-                print(f"    Std error:   {uncertainty.std_reprojection_error_px:.2f} px")
-                print(f"    Max error:   {uncertainty.max_reprojection_error_px:.2f} px")
-        
-        self.report.camera_projection = uncertainty
-        return uncertainty
-    
+            h = np.hstack([p2d, np.ones((len(p2d), 1))]).T
+            p2d = (R_cor @ h)[:2, :].T
+
+        if pts_2d_observed is not None:
+            n = min(len(p2d), len(pts_2d_observed))
+            if n > 0:
+                errs = np.linalg.norm(p2d[:n] - pts_2d_observed[:n], axis=1)
+                u.reprojection_errors_px      = errs
+                u.mean_reprojection_error_px  = float(np.mean(errs))
+                u.std_reprojection_error_px   = float(np.std(errs))
+                u.max_reprojection_error_px   = float(np.max(errs))
+
+        u.condition_number = float(np.linalg.cond(self.calib_data.K))
+        u.notes = f"K cond={u.condition_number:.2f}"
+
+        if self.verbose and u.mean_reprojection_error_px is not None:
+            print(f"  [Stage 3] reproj mean={u.mean_reprojection_error_px:.2f}px "
+                  f"max={u.max_reprojection_error_px:.2f}px")
+
+        self.report.camera_projection = u
+        return u
+
+    # ------------------------------------------------------------------
+    # Full pipeline
+    # ------------------------------------------------------------------
     def analyze_full_pipeline(
         self,
-        rb_data: Dict[str, Any],
-        marker_positions_m: Dict[str, npt.NDArray[np.float64]],
+        rb_data: Dict,
+        marker_positions_m: Dict[str, npt.NDArray],
         matching: Dict[str, int],
         frame_id: int = 0,
-        keypoints_2d: Optional[npt.NDArray[np.float64]] = None,
-        R_cor: Optional[npt.NDArray[np.float64]] = None
+        keypoints_2d: Optional[npt.NDArray] = None,
+        R_cor: Optional[npt.NDArray] = None,
     ) -> UncertaintyReport:
-        """
-        Perform complete uncertainty analysis through the entire pipeline.
-        
-        Args:
-            rb_data: Rigid body tracking data
-            marker_positions_m: OptiTrack marker positions for SVD fitting
-            matching: Marker name to pyramid point ID mapping
-            frame_id: Frame to analyze
-            keypoints_2d: Observed 2D keypoints (Nx2), optional
-            R_cor: Rotation correction matrix, optional
-            
-        Returns:
-            Complete uncertainty report
-        """
-        if self.verbose:
-            print("\n" + "="*70)
-            print("FULL PIPELINE UNCERTAINTY ANALYSIS")
-            print("="*70)
-        
-        # Stage 1: Model → OptiTrack
-        self.analyze_model_to_optitrack(marker_positions_m, matching)
-        
-        # Get all pyramid points (0-17)
-        points_pyramid = self.transformer.get_pyramid_points_in_pyramid_frame()
-        
-        # Stage 2: OptiTrack → Camera
-        self.analyze_optitrack_to_camera(rb_data, frame_id, points_pyramid)
-        
-        # Stage 3: Camera Projection
-        # Transform points through full pipeline for projection analysis
-        points_optitrack = self.transformer.transform_pyramid_to_optitrack(points_pyramid)
-        
-        T_World_Pyramid = rb_data["Pyramid_RB"][frame_id].get_transform()
-        T_World_Lens = rb_data["Lens_RB"][frame_id].get_transform()
-        RT = np.linalg.inv(T_World_Lens @ self.calib_data.RT)
-        
-        # To world frame
-        n_points = points_optitrack.shape[0]
-        points_hom = np.hstack([points_optitrack, np.ones((n_points, 1))])
-        points_world = (T_World_Pyramid @ points_hom.T).T[:, :3]
-        
-        # To camera frame
-        points_camera = (RT[:3, :3] @ points_world.T + RT[:3, 3:4]).T
-        
-        self.analyze_camera_projection(points_camera, keypoints_2d, R_cor)
-        
-        # Calculate total end-to-end error if 2D observations provided
-        if keypoints_2d is not None and self.report.camera_projection.mean_reprojection_error_px is not None:
-            self.report.total_reprojection_error_px = self.report.camera_projection.mean_reprojection_error_px
-        
-        # Error propagation analysis
-        self._analyze_error_propagation()
-        
-        return self.report
-    
-    def _analyze_error_propagation(self) -> None:
-        """
-        Analyze how errors propagate through the pipeline.
-        
-        Uses first-order error propagation (linearization).
-        """
-        if self.verbose:
-            print("\n" + "="*70)
-            print("ERROR PROPAGATION ANALYSIS")
-            print("="*70)
-        
-        propagation = {}
-        
-        # Stage 1 contribution
-        if self.report.model_to_optitrack is not None:
-            stage1_error_mm = self.report.model_to_optitrack.mean_error_3d_m * 1000
-            propagation["stage1_3d_error_mm"] = stage1_error_mm
-            
-            if self.verbose:
-                print(f"  Stage 1 (Model→OptiTrack): {stage1_error_mm:.3f} mm")
-        
-        # Stage 2 contribution
-        if self.report.optitrack_to_camera is not None:
-            stage2_error_mm = self.report.optitrack_to_camera.translation_error_m * 1000
-            propagation["stage2_3d_error_mm"] = stage2_error_mm
-            
-            if self.verbose:
-                print(f"  Stage 2 (OptiTrack→Camera): {stage2_error_mm:.3f} mm")
-        
-        # Combined 3D error (RSS - root sum square)
-        if "stage1_3d_error_mm" in propagation and "stage2_3d_error_mm" in propagation:
-            combined_3d_error = np.sqrt(
-                propagation["stage1_3d_error_mm"]**2 + 
-                propagation["stage2_3d_error_mm"]**2
-            )
-            propagation["combined_3d_error_mm"] = combined_3d_error
-            
-            if self.verbose:
-                print(f"  Combined 3D error (RSS):    {combined_3d_error:.3f} mm")
-        
-        # Stage 3 contribution (projection)
-        if self.report.camera_projection is not None:
-            if self.report.camera_projection.mean_reprojection_error_px is not None:
-                propagation["projection_error_px"] = self.report.camera_projection.mean_reprojection_error_px
-                
-                if self.verbose:
-                    print(f"  Stage 3 (Projection):       {propagation['projection_error_px']:.2f} px")
-        
-        # Estimate 3D→2D propagation factor (depends on depth and focal length)
-        # Typical: 1mm @ 1m depth ≈ 1px error for f=1000px
-        if "combined_3d_error_mm" in propagation:
-            fx = self.calib_data.K[0, 0]
-            # Assume typical depth of 1m for estimation
-            estimated_depth_m = 1.0
-            expected_2d_error_from_3d = (propagation["combined_3d_error_mm"] / 1000) * (fx / estimated_depth_m)
-            propagation["expected_2d_error_from_3d_px"] = expected_2d_error_from_3d
-            
-            if self.verbose:
-                print(f"  Expected 2D error from 3D:  {expected_2d_error_from_3d:.2f} px (at {estimated_depth_m}m)")
-        
-        self.report.error_propagation_analysis = propagation
-    
-    def visualize_uncertainties(
-        self,
-        save_path: Optional[Path] = None,
-        show: bool = True
-    ) -> Optional[Figure]:
-        """
-        Create visualization of uncertainties at each stage.
-        
-        Args:
-            save_path: Path to save figure, optional
-            show: Whether to display the figure
-            
-        Returns:
-            Matplotlib Figure object
-        """
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        fig.suptitle("Uncertainty Analysis Across Transformation Pipeline", fontsize=16, fontweight='bold')
-        
-        # Plot 1: 3D errors by stage
-        ax1 = axes[0, 0]
-        stages = []
-        errors_3d_mm = []
-        error_bars = []
-        
-        if self.report.model_to_optitrack is not None:
-            stages.append("Model→\nOptiTrack")
-            errors_3d_mm.append(self.report.model_to_optitrack.mean_error_3d_m * 1000)
-            error_bars.append(self.report.model_to_optitrack.std_error_3d_m * 1000)
-        
-        if self.report.optitrack_to_camera is not None:
-            stages.append("OptiTrack→\nCamera")
-            errors_3d_mm.append(self.report.optitrack_to_camera.translation_error_m * 1000)
-            error_bars.append(0)  # No std available for this estimate
-        
-        if stages:
-            x_pos = np.arange(len(stages))
-            ax1.bar(x_pos, errors_3d_mm, yerr=error_bars, capsize=5, 
-                   color=['#2E86AB', '#A23B72'], alpha=0.7, edgecolor='black')
-            ax1.set_xticks(x_pos)
-            ax1.set_xticklabels(stages)
-            ax1.set_ylabel("3D Error (mm)", fontsize=12)
-            ax1.set_title("3D Geometric Errors", fontsize=13, fontweight='bold')
-            ax1.grid(axis='y', alpha=0.3)
-        
-        # Plot 2: Per-point 3D errors (Stage 1)
-        ax2 = axes[0, 1]
-        if self.report.model_to_optitrack is not None and self.report.model_to_optitrack.point_errors_3d_m is not None:
-            errors = self.report.model_to_optitrack.point_errors_3d_m * 1000
-            point_ids = np.arange(len(errors))
-            ax2.scatter(point_ids, errors, c=errors, cmap='YlOrRd', s=100, edgecolor='black', linewidth=1)
-            ax2.axhline(np.mean(errors), color='blue', linestyle='--', linewidth=2, label=f'Mean: {np.mean(errors):.2f} mm')
-            ax2.set_xlabel("Point ID", fontsize=12)
-            ax2.set_ylabel("3D Error (mm)", fontsize=12)
-            ax2.set_title("Per-Point SVD Fitting Errors", fontsize=13, fontweight='bold')
-            ax2.legend()
-            ax2.grid(alpha=0.3)
-        
-        # Plot 3: 2D reprojection errors
-        ax3 = axes[1, 0]
-        if self.report.camera_projection is not None and self.report.camera_projection.reprojection_errors_px is not None:
-            errors = self.report.camera_projection.reprojection_errors_px
-            point_ids = np.arange(len(errors))
-            ax3.scatter(point_ids, errors, c=errors, cmap='viridis', s=100, edgecolor='black', linewidth=1)
-            ax3.axhline(np.mean(errors), color='red', linestyle='--', linewidth=2, label=f'Mean: {np.mean(errors):.2f} px')
-            ax3.set_xlabel("Point ID", fontsize=12)
-            ax3.set_ylabel("Reprojection Error (px)", fontsize=12)
-            ax3.set_title("2D Reprojection Errors", fontsize=13, fontweight='bold')
-            ax3.legend()
-            ax3.grid(alpha=0.3)
-        
-        # Plot 4: Error propagation summary
-        ax4 = axes[1, 1]
-        if self.report.error_propagation_analysis:
-            labels = []
-            values = []
-            colors = []
-            
-            if "stage1_3d_error_mm" in self.report.error_propagation_analysis:
-                labels.append("Stage 1:\n3D Error")
-                values.append(self.report.error_propagation_analysis["stage1_3d_error_mm"])
-                colors.append('#2E86AB')
-            
-            if "stage2_3d_error_mm" in self.report.error_propagation_analysis:
-                labels.append("Stage 2:\n3D Error")
-                values.append(self.report.error_propagation_analysis["stage2_3d_error_mm"])
-                colors.append('#A23B72')
-            
-            if "combined_3d_error_mm" in self.report.error_propagation_analysis:
-                labels.append("Combined\n3D Error")
-                values.append(self.report.error_propagation_analysis["combined_3d_error_mm"])
-                colors.append('#F18F01')
-            
-            if "projection_error_px" in self.report.error_propagation_analysis:
-                # Scale to same units for comparison (convert px to mm equivalent)
-                labels.append("Final 2D\nError (px)")
-                values.append(self.report.error_propagation_analysis["projection_error_px"])
-                colors.append('#C73E1D')
-            
-            if labels:
-                x_pos = np.arange(len(labels))
-                bars = ax4.bar(x_pos, values, color=colors, alpha=0.7, edgecolor='black', linewidth=1.5)
-                ax4.set_xticks(x_pos)
-                ax4.set_xticklabels(labels, fontsize=10)
-                ax4.set_ylabel("Error Magnitude", fontsize=12)
-                ax4.set_title("Error Propagation Summary", fontsize=13, fontweight='bold')
-                ax4.grid(axis='y', alpha=0.3)
-                
-                # Add value labels on bars
-                for bar, val in zip(bars, values):
-                    height = bar.get_height()
-                    ax4.text(bar.get_x() + bar.get_width()/2., height,
-                            f'{val:.2f}',
-                            ha='center', va='bottom', fontsize=9, fontweight='bold')
-        
-        plt.tight_layout()
-        
-        if save_path is not None:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"✓ Uncertainty visualization saved to: {save_path}")
-        
-        if show:
-            plt.show()
-        
-        return fig
-    
-    def print_summary(self) -> None:
-        """Print a comprehensive summary of all uncertainties."""
-        print("\n" + "="*70)
-        print("UNCERTAINTY ANALYSIS SUMMARY")
-        print("="*70)
-        
         # Stage 1
-        if self.report.model_to_optitrack is not None:
-            u = self.report.model_to_optitrack
-            print("\n📊 Stage 1: 3D Model → OptiTrack Frame")
-            print(f"  Method: SVD rigid transformation")
-            print(f"  Points used: {u.num_points}")
-            print(f"  Mean 3D error:       {u.mean_error_3d_m*1000:.3f} ± {u.std_error_3d_m*1000:.3f} mm")
-            print(f"  Max 3D error:        {u.max_error_3d_m*1000:.3f} mm")
-            print(f"  Condition number:    {u.condition_number:.2f}")
-            print(f"  Quality: {'✓ Excellent' if u.mean_error_3d_m < 0.002 else '⚠ Acceptable' if u.mean_error_3d_m < 0.005 else '✗ Poor'}")
-        
+        self.analyze_model_to_optitrack(marker_positions_m, matching)
+
         # Stage 2
-        if self.report.optitrack_to_camera is not None:
-            u = self.report.optitrack_to_camera
-            print("\n📊 Stage 2: OptiTrack → Camera Frame (Extrinsics)")
-            print(f"  Translation noise:   {u.translation_error_m*1000:.3f} mm")
-            print(f"  Rotation noise:      {u.rotation_error_deg:.2f}°")
-            print(f"  Quality: {'✓ Good tracking' if u.translation_error_m < 0.002 else '⚠ Moderate noise'}")
-        
+        self.analyze_optitrack_to_camera(rb_data, frame_id)
+
+        # Build 3-D points in camera frame for stage 3
+        # Same computation as utils.py — no invented helper method needed
+        _pts_w  = self.transformer.points_m                   # all 22 points (world coords)
+        _R_pyr  = self.transformer.R_pyramid
+        _origin = self.transformer.pyramid_origin_m
+        pts_pyr  = (_R_pyr.T @ (_pts_w - _origin).T).T        # world → pyramid frame
+        pts_pyr  = pts_pyr[:18]                               # keep only points 0-17
+        pts_opti = self.transformer.transform_pyramid_to_optitrack(pts_pyr)
+
+        T_Pyr  = rb_data["Pyramid_RB"][frame_id].get_transform()
+        T_Lens = rb_data["Lens_RB"][frame_id].get_transform()
+        RT     = np.linalg.inv(T_Lens @ self.calib_data.RT)
+
+        n = pts_opti.shape[0]
+        pts_w = (T_Pyr @ np.hstack([pts_opti, np.ones((n, 1))]).T).T[:, :3]
+        pts_c = (RT[:3, :3] @ pts_w.T + RT[:3, 3:4]).T
+        self.report.points_3d_camera_last = pts_c.copy()
+
         # Stage 3
-        if self.report.camera_projection is not None:
-            u = self.report.camera_projection
-            print("\n📊 Stage 3: Camera Projection (Intrinsics)")
-            if u.mean_reprojection_error_px is not None:
-                print(f"  Mean reprojection:   {u.mean_reprojection_error_px:.2f} ± {u.std_reprojection_error_px:.2f} px")
-                print(f"  Max reprojection:    {u.max_reprojection_error_px:.2f} px")
-                print(f"  Quality: {'✓ Excellent' if u.mean_reprojection_error_px < 2 else '⚠ Acceptable' if u.mean_reprojection_error_px < 5 else '✗ Poor'}")
-            print(f"  K condition number:  {u.condition_number:.2f}")
-        
-        # Overall
-        if self.report.error_propagation_analysis:
-            print("\n📊 Error Propagation Analysis")
-            for key, value in self.report.error_propagation_analysis.items():
-                print(f"  {key}: {value:.3f}")
-        
-        print("\n" + "="*70)
+        self.analyze_camera_projection(pts_c, keypoints_2d, R_cor)
+
+        if (keypoints_2d is not None
+                and self.report.camera_projection is not None
+                and self.report.camera_projection.mean_reprojection_error_px is not None):
+            self.report.total_reprojection_error_px = (
+                self.report.camera_projection.mean_reprojection_error_px
+            )
+
+        return self.report
+
+    def print_summary(self) -> None:
+        print("\n" + "=" * 55 + "\nUNCERTAINTY SUMMARY\n" + "=" * 55)
+        u1 = self.report.model_to_optitrack
+        if u1 and u1.mean_error_3d_m is not None:
+            q = "[OK]" if u1.mean_error_3d_m < 0.002 else "[!]" if u1.mean_error_3d_m < 0.005 else "[X]"
+            print(f"{q} SVD:       {u1.mean_error_3d_m*1e3:.3f} ± {u1.std_error_3d_m*1e3:.3f} mm")
+        u2 = self.report.optitrack_to_camera
+        if u2:
+            print(f"     Jitter: trans={u2.translation_error_m*1e3:.3f}mm  rot={u2.rotation_error_deg:.4f}°")
+        u3 = self.report.camera_projection
+        if u3 and u3.mean_reprojection_error_px is not None:
+            q = "[OK]" if u3.mean_reprojection_error_px < 2 else "[!]" if u3.mean_reprojection_error_px < 5 else "[X]"
+            print(f"{q} Reproj:    {u3.mean_reprojection_error_px:.2f} ± {u3.std_reprojection_error_px:.2f} px")
+
+
+# =============================================================================
+# FrameRecord  – lightweight snapshot pushed into UncertaintyPlotter
+# =============================================================================
+
+@dataclass
+class FrameRecord:
+    """All uncertainty numbers for one frame, ready to plot."""
+    frame_id: int
+    # Stage 1
+    svd_mean_mm:   float = 0.0
+    svd_std_mm:    float = 0.0
+    svd_max_mm:    float = 0.0
+    svd_cond:      float = 0.0
+    # Stage 2
+    trans_jitter_mm: float = 0.0
+    rot_jitter_deg:  float = 0.0
+    # Stage 3
+    reproj_mean_px: Optional[float] = None
+    reproj_std_px:  Optional[float] = None
+    reproj_max_px:  Optional[float] = None
+    # Derived: predicted RSS error (mm → px using rough focal-length factor)
+    predicted_rss_px: float = 0.0
+
+
+def frame_record_from_analyzer(frame_id: int, analyzer: UncertaintyAnalyzer) -> FrameRecord:
+    """Build a FrameRecord from the latest report in an UncertaintyAnalyzer."""
+    r  = analyzer.report
+    u1 = r.model_to_optitrack
+    u2 = r.optitrack_to_camera
+    u3 = r.camera_projection
+
+    svd_mean = (u1.mean_error_3d_m or 0.0) * 1e3 if u1 else 0.0
+    svd_std  = (u1.std_error_3d_m  or 0.0) * 1e3 if u1 else 0.0
+    svd_max  = (u1.max_error_3d_m  or 0.0) * 1e3 if u1 else 0.0
+    svd_cond = (u1.condition_number or 0.0)       if u1 else 0.0
+
+    t_jit = (u2.translation_error_m or 0.0) * 1e3 if u2 else 0.0
+    r_jit = (u2.rotation_error_deg  or 0.0)        if u2 else 0.0
+
+    reproj_mean = u3.mean_reprojection_error_px if u3 else None
+    reproj_std  = u3.std_reprojection_error_px  if u3 else None
+    reproj_max  = u3.max_reprojection_error_px  if u3 else None
+
+    # Rough focal-length estimate to convert mm → px for RSS display
+    K = analyzer.calib_data.K
+    focal_px_per_mm = float(np.mean([K[0, 0], K[1, 1]])) / 1000.0
+    rss_px = np.sqrt(
+        (svd_mean * focal_px_per_mm) ** 2 +
+        (t_jit    * focal_px_per_mm) ** 2
+    )
+
+    return FrameRecord(
+        frame_id       = frame_id,
+        svd_mean_mm    = svd_mean,
+        svd_std_mm     = svd_std,
+        svd_max_mm     = svd_max,
+        svd_cond       = svd_cond,
+        trans_jitter_mm= t_jit,
+        rot_jitter_deg  = r_jit,
+        reproj_mean_px  = reproj_mean,
+        reproj_std_px   = reproj_std,
+        reproj_max_px   = reproj_max,
+        predicted_rss_px= float(rss_px),
+    )
+
+
+# =============================================================================
+# UncertaintyPlotter  – separate cv2 window, 4 panels
+# =============================================================================
+
+class UncertaintyPlotter:
+    """
+    4-panel diagnostic plot shown in a **dedicated cv2 window**.
+
+    Panels
+    ------
+    1  Stage 1 – SVD 3D error (mm)  [rolling time-series]
+    2  Stage 2 – Tracking jitter: translation (mm) and rotation (°) [rolling]
+    3  Stage 3 – Reprojection error (px) vs good/accept thresholds [rolling]
+    4  Error summary bar chart (current frame snapshot)
+
+    Usage
+    -----
+        plotter = UncertaintyPlotter()
+        # inside video loop, every N frames:
+        rec = frame_record_from_analyzer(frame_id, analyzer)
+        plotter.update(rec)
+        cv2.waitKey(1)   # allows cv2 to process window events
+    """
+
+    _BG    = "#1a1a2e"
+    _PANEL = "#0f0f23"
+    _SPINE = "#444466"
+    _TICK  = "#aaaacc"
+    _GREEN = "#2ecc71"
+    _AMBER = "#f39c12"
+    _RED   = "#e74c3c"
+    _BLUE  = "#3498db"
+    _PURP  = "#9b59b6"
+    _WHITE = "#ffffff"
+
+    def __init__(
+        self,
+        history_len: int = 200,
+        fig_w_px: int = 1100,
+        fig_h_px: int = 650,
+        window_name: str = "Uncertainty Analysis",
+    ):
+        self.history:     List[FrameRecord] = []
+        self.history_len  = history_len
+        self.window_name  = window_name
+        self._dpi         = 100
+
+        fw = fig_w_px / self._dpi
+        fh = fig_h_px / self._dpi
+
+        self.fig = plt.figure(figsize=(fw, fh), facecolor=self._BG)
+        self.fig.suptitle(
+            "Uncertainty Analysis  ·  OptiTrack → Camera Pipeline",
+            fontsize=11, fontweight="bold", color="white", y=0.98,
+        )
+        gs = gridspec.GridSpec(
+            2, 2, figure=self.fig,
+            hspace=0.50, wspace=0.38,
+            left=0.07, right=0.97, top=0.92, bottom=0.08,
+        )
+        self.axes = [self.fig.add_subplot(gs[r, c]) for r in range(2) for c in range(2)]
+        for ax in self.axes:
+            self._style_ax(ax)
+
+        self.canvas = FigureCanvasAgg(self.fig)
+
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.window_name, fig_w_px, fig_h_px)
+
+    # ------------------------------------------------------------------
+    def _style_ax(self, ax) -> None:
+        ax.set_facecolor(self._PANEL)
+        for sp in ax.spines.values():
+            sp.set_color(self._SPINE)
+        ax.tick_params(colors=self._TICK, labelsize=8)
+        ax.yaxis.label.set_color(self._TICK)
+        ax.xaxis.label.set_color(self._TICK)
+        ax.title.set_color("white")
+
+    def _ann(self, ax, text: str, color: str = "#ffcc00") -> None:
+        ax.annotate(
+            text, xy=(0.97, 0.95), xycoords="axes fraction",
+            ha="right", va="top", fontsize=7.5, color=color,
+            bbox=dict(boxstyle="round,pad=0.3", fc=self._BG, ec=color, alpha=0.85),
+        )
+
+    def _thresholds(self, ax) -> None:
+        ax.axhline(THRESH_GOOD,   color=self._GREEN, linestyle="--", lw=1, alpha=0.7,
+                   label=f"Good   ({THRESH_GOOD}px)")
+        ax.axhline(THRESH_ACCEPT, color=self._AMBER, linestyle="--", lw=1, alpha=0.7,
+                   label=f"Accept ({THRESH_ACCEPT}px)")
+
+    # ------------------------------------------------------------------
+    def update(self, record: FrameRecord) -> None:
+        """Append a FrameRecord, redraw, and refresh the cv2 window."""
+        self.history.append(record)
+        if len(self.history) > self.history_len:
+            self.history = self.history[-self.history_len:]
+        self._redraw()
+        self._push()
+
+    def _push(self) -> None:
+        self.canvas.draw()
+        buf = self.canvas.buffer_rgba()
+        img = np.asarray(buf, dtype=np.uint8)
+        bgr = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        cv2.imshow(self.window_name, bgr)
+
+    def close(self) -> None:
+        cv2.destroyWindow(self.window_name)
+        plt.close(self.fig)
+
+    # ------------------------------------------------------------------
+    def _redraw(self) -> None:
+        for ax in self.axes:
+            ax.cla()
+            self._style_ax(ax)
+        if not self.history:
+            return
+        frames = [r.frame_id for r in self.history]
+        self._panel1_svd(self.axes[0], frames)
+        self._panel2_jitter(self.axes[1], frames)
+        self._panel3_reproj(self.axes[2], frames)
+        self._panel4_budget(self.axes[3])
+
+    # ------------------------------------------------------------------
+    # Panel 1 – Stage 1: SVD 3D fitting error
+    # ------------------------------------------------------------------
+    def _panel1_svd(self, ax, frames: List[int]) -> None:
+        ax.set_title("Stage 1 · SVD 3D Fitting Error", fontsize=9, fontweight="bold", pad=4)
+        ax.set_xlabel("Frame", fontsize=8)
+        ax.set_ylabel("Error (mm)", fontsize=8)
+
+        mean = [r.svd_mean_mm for r in self.history]
+        lo   = [r.svd_mean_mm - r.svd_std_mm for r in self.history]
+        hi   = [r.svd_mean_mm + r.svd_std_mm for r in self.history]
+        mx   = [r.svd_max_mm  for r in self.history]
+
+        fa = np.array(frames)
+        ax.fill_between(fa, lo, hi, alpha=0.2, color=self._BLUE, label="±1σ")
+        ax.plot(fa, mean, color=self._BLUE,  lw=1.5, label="Mean")
+        ax.plot(fa, mx,   color=self._AMBER, lw=1.0, linestyle=":", label="Max")
+
+        # Quality thresholds in mm
+        ax.axhline(2.0, color=self._GREEN, linestyle="--", lw=1, alpha=0.7, label="Good (2mm)")
+        ax.axhline(5.0, color=self._AMBER, linestyle="--", lw=1, alpha=0.7, label="Accept (5mm)")
+
+        last = self.history[-1]
+        c = (self._GREEN if last.svd_mean_mm < 2 else
+             self._AMBER if last.svd_mean_mm < 5 else self._RED)
+        self._ann(ax, f"Now:  {last.svd_mean_mm:.3f} mm\n"
+                      f"Max:  {last.svd_max_mm:.3f} mm\n"
+                      f"Cond: {last.svd_cond:.1f}", color=c)
+
+        ax.legend(fontsize=7, loc="upper left", labelcolor="white",
+                  facecolor=self._BG, edgecolor=self._SPINE)
+        ax.grid(axis="y", alpha=0.12, color=self._SPINE)
+
+    # ------------------------------------------------------------------
+    # Panel 2 – Stage 2: Tracking jitter
+    # ------------------------------------------------------------------
+    def _panel2_jitter(self, ax, frames: List[int]) -> None:
+        ax.set_title("Stage 2 · OptiTrack Tracking Jitter", fontsize=9, fontweight="bold", pad=4)
+        ax.set_xlabel("Frame", fontsize=8)
+
+        fa    = np.array(frames)
+        trans = [r.trans_jitter_mm for r in self.history]
+        rot   = [r.rot_jitter_deg  for r in self.history]
+
+        ax_r = ax.twinx()
+        ax_r.set_facecolor(self._PANEL)
+        ax_r.tick_params(colors=self._TICK, labelsize=8)
+        ax_r.yaxis.label.set_color(self._TICK)
+
+        ax.plot(fa,   trans, color=self._BLUE, lw=1.5, label="Trans jitter (mm)")
+        ax_r.plot(fa, rot,   color=self._PURP, lw=1.5, linestyle="--", label="Rot jitter (°)")
+
+        ax.set_ylabel("Translation jitter (mm)", fontsize=8)
+        ax_r.set_ylabel("Rotation jitter (°)", fontsize=8)
+
+        ax.axhline(0.5, color=self._GREEN, linestyle="--", lw=1, alpha=0.6)
+        ax.axhline(2.0, color=self._AMBER, linestyle="--", lw=1, alpha=0.6)
+
+        last = self.history[-1]
+        c = self._GREEN if last.trans_jitter_mm < 0.5 else \
+            self._AMBER if last.trans_jitter_mm < 2.0 else self._RED
+        self._ann(ax, f"Trans: {last.trans_jitter_mm:.3f} mm\n"
+                      f"Rot:   {last.rot_jitter_deg:.4f} °", color=c)
+
+        lines1, lbl1 = ax.get_legend_handles_labels()
+        lines2, lbl2 = ax_r.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, lbl1 + lbl2,
+                  fontsize=7, loc="upper left", labelcolor="white",
+                  facecolor=self._BG, edgecolor=self._SPINE)
+        ax.grid(axis="y", alpha=0.12, color=self._SPINE)
+
+    # ------------------------------------------------------------------
+    # Panel 3 – Stage 3: Reprojection error
+    # ------------------------------------------------------------------
+    def _panel3_reproj(self, ax, frames: List[int]) -> None:
+        ax.set_title("Stage 3 · Reprojection Error  vs  Keypoints", fontsize=9,
+                     fontweight="bold", pad=4)
+        ax.set_xlabel("Frame", fontsize=8)
+        ax.set_ylabel("Error (px)", fontsize=8)
+
+        fa   = np.array(frames)
+        mean = [r.reproj_mean_px if r.reproj_mean_px is not None else np.nan
+                for r in self.history]
+        mx   = [r.reproj_max_px  if r.reproj_max_px  is not None else np.nan
+                for r in self.history]
+        pred = [r.predicted_rss_px for r in self.history]
+
+        has_real = any(not np.isnan(v) for v in mean)
+
+        ax.plot(fa, pred, color=self._WHITE,  lw=1.2, linestyle=":", alpha=0.7,
+                label="Predicted RSS (px)")
+        if has_real:
+            ax.plot(fa, mean, color=self._RED,  lw=1.8, label="Measured mean (px)")
+            ax.plot(fa, mx,   color=self._AMBER, lw=1.0, linestyle=":", label="Measured max (px)")
+
+        self._thresholds(ax)
+
+        last = self.history[-1]
+        if last.reproj_mean_px is not None:
+            c = (self._GREEN if last.reproj_mean_px < THRESH_GOOD else
+                 self._AMBER if last.reproj_mean_px < THRESH_ACCEPT else self._RED)
+            self._ann(ax, f"Measured: {last.reproj_mean_px:.2f} px\n"
+                          f"Max:      {last.reproj_max_px:.2f} px\n"
+                          f"Predicted:{last.predicted_rss_px:.2f} px", color=c)
+        else:
+            self._ann(ax, f"No keypoints loaded\n"
+                          f"Predicted RSS: {last.predicted_rss_px:.2f} px",
+                      color=self._TICK)
+
+        ax.legend(fontsize=7, loc="upper left", labelcolor="white",
+                  facecolor=self._BG, edgecolor=self._SPINE)
+        ax.grid(axis="y", alpha=0.12, color=self._SPINE)
+
+    # ------------------------------------------------------------------
+    # Panel 4 – Error budget snapshot (current frame)
+    # ------------------------------------------------------------------
+    def _panel4_budget(self, ax) -> None:
+        ax.set_title("Error Budget · Current Frame Snapshot", fontsize=9,
+                     fontweight="bold", pad=4)
+
+        last = self.history[-1]
+        K    = None  # focal info already baked into predicted_rss_px
+
+        labels  = ["SVD\n(mm)", "Trans\njitter (mm)", "Rot\njitter (°)",
+                   "Reproj\nmean (px)", "Predicted\nRSS (px)"]
+        values  = [last.svd_mean_mm, last.trans_jitter_mm, last.rot_jitter_deg,
+                   last.reproj_mean_px if last.reproj_mean_px is not None else 0.0,
+                   last.predicted_rss_px]
+        colors  = [self._BLUE, self._PURP, self._AMBER, self._RED, self._WHITE]
+
+        bars = ax.bar(labels, values, color=colors, alpha=0.75, edgecolor=self._SPINE, zorder=3)
+        ax.set_ylabel("Value (see label for unit)", fontsize=8)
+        ax.grid(axis="y", alpha=0.15, color=self._SPINE, zorder=0)
+
+        for bar, val in zip(bars, values):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + max(values) * 0.02,
+                f"{val:.3f}",
+                ha="center", va="bottom", fontsize=7.5, color="white",
+            )
+
+        # Colour-code reproj bar
+        if last.reproj_mean_px is not None:
+            c = (self._GREEN if last.reproj_mean_px < THRESH_GOOD else
+                 self._AMBER if last.reproj_mean_px < THRESH_ACCEPT else self._RED)
+            status = ("GOOD" if last.reproj_mean_px < THRESH_GOOD else
+                      "ACCEPT" if last.reproj_mean_px < THRESH_ACCEPT else "POOR")
+            self._ann(ax, f"Frame {last.frame_id}\nStatus: {status}", color=c)
+        else:
+            self._ann(ax, f"Frame {last.frame_id}\n(no keypoints)", color=self._TICK)
