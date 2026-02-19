@@ -1009,6 +1009,15 @@ class PyramidTransformer:
         print(f"\n✓ Distance ranking with 3D view plotted")
         return sorted_points, distances, point_indices, sorted_idx, sorted_distances
 
+    def get_pyramid_points_in_pyramid_frame(self) -> np.ndarray:
+        """
+        Get all pyramid points transformed to the pyramid frame.
+
+        Returns:
+            N×3 array of points in pyramid frame (meters)
+        """
+        return (self.R_pyramid.T @ (self.points_m - self.pyramid_origin_m).T).T
+
 
 def plot_svd_fit_quality(
     transformer: PyramidTransformer,
