@@ -97,6 +97,7 @@ def main():
             vectors_log_path=vectors_log_path,  # Load initial theta from file
             verify_transformation=True,
             enable_uncertainty_analysis=True,
+            start_frame_id=1800
             # compute_metrics=True,
             # enable_realtime_plot=True,
             # metrics_output_path=metric_output,

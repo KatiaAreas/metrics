@@ -25,8 +25,10 @@ from pyramid_transformer import PyramidTransformer, extract_marker_positions_fro
 from uncertainty_analysis import (
     UncertaintyAnalyzer,
     UncertaintyPlotter,
+    FrameRecord,
     frame_record_from_analyzer,
 )
+
 
 # ---------------------------------------------------------------------------
 # TemporalPointFilter  (unchanged)
@@ -190,10 +192,12 @@ def display_pyramid(
         ransac_threshold: float = 0.01,
         enable_temporal_filter: bool = True,
         temporal_window_size: int = 5,
+        start_frame_id: int = 0,
 ) -> None:
     """
     Display pyramid points overlaid on video frames.
     Uncertainty plot is shown in a SEPARATE cv2 window, not overlaid on the video.
+    Press SPACEBAR on either the video window or the uncertainty window to pause/resume.
     """
     # =========================================================================
     # STEP 1: Load pyramid geometry
@@ -388,9 +392,10 @@ def display_pyramid(
     if enable_uncertainty_analysis:
         print("Uncertainty analysis: ENABLED (separate window)")
 
-    start_frame_id: int = 0
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame_id)
     frame_id: int = start_frame_id
+    if start_frame_id > 0:
+        print(f"Starting from frame {start_frame_id}")
 
     notch_visible = False
     circle_center = None
